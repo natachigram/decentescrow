@@ -1,6 +1,6 @@
 # AO Escrow for Freelance Jobs
 
-This repo contains an Arweave AO process implementing a decentralized escrow for a freelance marketplace, plus Node scripts and a minimal React integration.
+This repo contains an Arweave AO process implementing a decentralized escrow for a freelance marketplace, plus Node scripts for interaction. No frontend is included in this repo.
 
 Important: The escrow requires an AO token process to exist. If your platform doesn't have a token yet, create one via coin.ar.io or a Warp token template first, then use its Process ID.
 
@@ -21,33 +21,31 @@ Important: The escrow requires an AO token process to exist. If your platform do
 - Start the REPL and load the process:
 	- Open a terminal in the repo root.
 	- Start `aos`.
-	- Deploy from file:
-		- In the REPL, run: `Deploy from file ao/escrow.lua`
+	- Deploy from file in the REPL: `Deploy from file ao/escrow.lua`
 	- Note the new Process ID (this is your `ESCROW_PROCESS_ID`).
-	- Initialize owner (run once from admin wallet):
-		- `Send({ Target = ESCROW_PROCESS_ID, Action = 'InitOwner' })`
-	- Optionally set config (fee/treasury/arbiter/timeout):
-		- `Send({ Target = ESCROW_PROCESS_ID, Action = 'SetConfig', platformFeeBps = 100, platformTreasury = 'AR_TREASURY_ADDRESS', arbiter = 'ARBITER_ADDRESS', timeoutSecs = 604800 })`
-	- Allow the platform token (recommended):
-		- `Send({ Target = ESCROW_PROCESS_ID, Action = 'AllowToken', token = TOKEN_PROCESS_ID })`
-	- Set default token (for seamless deposits without specifying token):
-		- `Send({ Target = ESCROW_PROCESS_ID, Action = 'SetDefaultToken', token = TOKEN_PROCESS_ID })`
-	- Admin ops:
-		- Pause: `Send({ Target = ESCROW_PROCESS_ID, Action = 'Pause' })`
-		- Unpause: `Send({ Target = ESCROW_PROCESS_ID, Action = 'Unpause' })`
-		- Transfer ownership: `Send({ Target = ESCROW_PROCESS_ID, Action = 'TransferOwnership', newOwner = 'NEW_OWNER_ADDR' })`
 
-3) Approvals
+3) Configure scripts
+- Copy `config/config.example.json` to `config/config.json` and fill values (set your `ESCROW_PROCESS_ID`, token, addresses, fee/timeout).
+- Create a `.env` at the repo root with `WALLET_PATH=/absolute/path/to/wallet.json`.
+- From `scripts/`, run `npm install`.
+
+4) Bootstrap (owner + token + config)
+- From `scripts/`, run: `npm run bootstrap` (after setting `ESCROW_PROCESS_ID`).
+- This will run InitOwner, SetDefaultToken, AllowToken and optionally SetConfig.
+
+5) Approvals
 - Ensure the token process supports approvals or process-call transfers to allow the escrow to pull funds from the client on deposit.
 - The client must approve the escrow process to spend at least `amount` of tokens, if the token uses approval mechanics.
 - If the token doesn't support approvals, pre-transfer the funds to the escrow process address and then call `Deposit` (the contract will record state; ensure funds are present).
 
-4) Use Scripts
-- Copy `config/config.example.json` to `config/config.json` and fill values.
-- Install deps and run the scripts (deposit, release, refund).
+6) Use Scripts
+- Approve: from `scripts/` run `QTY=1000000 npm run approve`
+- Deposit: `AMOUNT=1000000 JOB_ID=job-1 npm run deposit`
+- Release: `JOB_ID=job-1 npm run release`
+- Refund: `JOB_ID=job-1 npm run refund`
 
-5) Frontend Example
-- Check `frontend-example/` for a tiny component using ArConnect and `@permaweb/aoconnect`.
+Tips:
+- Use Wander testnet if preferred; ensure both token and escrow are deployed to the same environment.
 
 ## Security Notes
 - The lifecycle is `locked -> released | refunded`. No double spending.

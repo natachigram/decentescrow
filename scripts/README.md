@@ -21,6 +21,20 @@ Minimal Node scripts for interacting with the escrow via `@permaweb/aoconnect`.
 - Refund:
   - `JOB_ID=job-1 npm run refund`
 
+### Bootstrap (owner + default token + config)
+
+After deploying the process in aos, set `ESCROW_PROCESS_ID` in `config/config.json` and run:
+
+```
+npm run bootstrap
+```
+
+This will:
+- Init owner
+- Set default token (auto-allow)
+- Explicitly allow token
+- Apply platform fee/treasury/arbiter/timeout if present in config
+
 ### Admin
 
 - Init owner:

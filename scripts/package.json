@@ -1,17 +1,18 @@
 {
-  "name": "ao-escrow-scripts",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@permaweb/aoconnect": "^0.0.47",
-    "dotenv": "^16.4.5"
-  },
-  "scripts": {
-    "deposit": "node deposit.js",
-    "release": "node release.js",
-    "refund": "node refund.js",
-  "approve": "node approve.js",
-  "admin": "node admin.js"
-  }
+    "name": "ao-escrow-scripts",
+    "version": "1.0.0",
+    "private": true,
+    "type": "module",
+    "dependencies": {
+        "@permaweb/aoconnect": "^0.0.47",
+        "dotenv": "^16.4.5"
+    },
+    "scripts": {
+        "deposit": "node deposit.js",
+        "release": "node release.js",
+        "refund": "node refund.js",
+        "approve": "node approve.js",
+        "admin": "node admin.js",
+        "bootstrap": "node bootstrap.js"
+    }
 }

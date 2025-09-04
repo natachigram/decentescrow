@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test-lua:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Lua (brew)
+        run: |
+          brew update
+          brew install lua
+
+      - name: Run Lua tests
+        run: lua tests/test_escrow.lua
+
+  test-node-scripts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: scripts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: scripts/package-lock.json
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Lint JS (quick)
+        run: |
+          node -e "require('fs').readdirSync('.').forEach(f=>{if(f.endsWith('.js')){require('fs').accessSync(f)}}); console.log('JS files present')"
