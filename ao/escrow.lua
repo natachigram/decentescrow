@@ -1,7 +1,4 @@
--- AO Escrow Process (Lua-like for AO)
--- Features: deposit, release, refund, optional fee, arbiter, timeout, metadata
--- Assumes a fungible AO token process that supports `Transfer` messages and optionally `Approve`/`TransferFrom` patterns.
--- Author: GitHub Copilot
+
 
 local json = require('json')
 
@@ -177,26 +174,49 @@ Handlers.add('GetJob', Handlers.utils.hasMatchingTag('Action', 'GetJob'), functi
   ao.send({ Target = msg.From, Action = 'GetJobResult', JobId = jobId, Data = json.encode(job or {}) })
 end)
 
--- Deposit: deposit(jobId, client, freelancer, token, amount, meta?)
+-- Deposit: Creates a new escrow job with funding but no assigned freelancer yet
+-- Status: none → 'funded'
+-- Parameters: jobId, client, token, amount, meta (optional)
+-- Only the client can call this to fund their own job
 Handlers.add('Deposit', Handlers.utils.hasMatchingTag('Action', 'Deposit'), function(msg)
   ensure(not Paused, 'Paused')
   local jobId = tostring(msg.jobId)
   local client = msg.client
-  local freelancer = msg.freelancer
   local token = msg.token or defaultToken
   local amount = tostring(msg.amount or '')
   local meta = msg.meta -- optional table/string
 
-  ensure(not jobs[jobId], 'Job already funded')
-  ensure(not isEmpty(jobId) and not isEmpty(client) and not isEmpty(freelancer) and not isEmpty(token), 'Missing fields')
+  -- Check for job ID conflicts - allow reuse only if previous job is in final state
+  local existingJob = jobs[jobId]
+  if existingJob then
+    local finalStates = { cancelled = true, released = true, refunded = true }
+    ensure(finalStates[existingJob.status], 'Job ID already in use by active job')
+    -- Note: Reusing job ID will overwrite the previous job record entirely.
+    -- Previous job history is not preserved in this implementation.
+  end
+  
+  ensure(not isEmpty(jobId) and not isEmpty(client) and not isEmpty(token), 'Missing required fields: jobId, client, token')
   ensure(isDigits(amount) and cmp(amount, '0') > 0, 'Amount must be positive integer string')
   -- Only the client is allowed to initiate a deposit for their job
-  ensure(msg.From == client, 'Only client can deposit')
+  ensure(msg.From == client, 'Only client can deposit for their own job')
   -- Token allowlist
   if enforceAllowlist then ensure(allowedTokens[token] == true, 'Token not allowed') end
   -- Basic limits
   ensure(#jobId <= 128, 'jobId too long')
-  if type(meta) == 'string' then ensure(#meta <= 2048, 'meta too long') end
+  
+  -- Validate meta size for both string and table types
+  if meta ~= nil then
+    local metaStr
+    if type(meta) == 'string' then
+      metaStr = meta
+    else
+      -- Serialize table to JSON to check size
+      local success, result = pcall(json.encode, meta)
+      ensure(success, 'Invalid meta: cannot serialize to JSON')
+      metaStr = result
+    end
+    ensure(#metaStr <= 2048, 'meta too long (max 2048 characters when serialized)')
+  end
 
   -- Pull funds from client to this process. Prefer TransferFrom if supported, else require client to pre-transfer.
   -- We optimistically try TransferFrom and fall back if token errors. In AO, failures throw; caller should pre-approve.
@@ -212,16 +232,93 @@ Handlers.add('Deposit', Handlers.utils.hasMatchingTag('Action', 'Deposit'), func
 
   jobs[jobId] = {
     client = client,
-    freelancer = freelancer,
+    freelancer = nil, -- No freelancer assigned yet
     token = token,
-  amount = amount,
-    status = 'locked',
-  createdAt = now(),
+    amount = amount,
+    status = 'funded', -- Job is funded but not yet assigned
+    createdAt = now(),
     meta = meta,
     dispute = nil,
   }
 
-  emit('Deposited', { jobId = jobId, client = client, freelancer = freelancer, token = token, amount = amount })
+  emit('Deposited', { 
+    jobId = jobId, 
+    status = 'funded',
+    by = 'client',
+    client = client, 
+    freelancer = nil, 
+    amount = amount,
+    token = token 
+  })
+end)
+
+-- AssignFreelancer: Assigns a freelancer to a funded job
+-- Status: 'funded' → 'locked'
+-- Parameters: jobId, freelancer
+-- Only the client of the job can call this
+Handlers.add('AssignFreelancer', Handlers.utils.hasMatchingTag('Action', 'AssignFreelancer'), function(msg)
+  ensure(not Paused, 'Paused')
+  local jobId = tostring(msg.jobId)
+  local freelancer = msg.freelancer
+  
+  ensure(not isEmpty(jobId), 'Missing jobId')
+  ensure(not isEmpty(freelancer), 'Missing freelancer')
+  
+  local job = jobs[jobId]
+  ensure(job ~= nil, 'Job not found')
+  ensure(job.status == 'funded', 'Job must be in funded status to assign freelancer')
+  ensure(msg.From == job.client, 'Only the client can assign freelancer to their job')
+  
+  -- Assign the freelancer and lock the job
+  job.freelancer = freelancer
+  job.status = 'locked'
+  job.assignedAt = now()
+  
+  emit('FreelancerAssigned', { 
+    jobId = jobId, 
+    status = 'locked',
+    by = 'client',
+    client = job.client,
+    freelancer = freelancer, 
+    amount = job.amount 
+  })
+end)
+
+-- CancelUnassigned: Allows client to cancel and refund a funded job before assigning freelancer
+-- Status: 'funded' → 'cancelled' (final state)
+-- Only the client can call this and only for unassigned jobs
+Handlers.add('CancelUnassigned', Handlers.utils.hasMatchingTag('Action', 'CancelUnassigned'), function(msg)
+  ensure(not Paused, 'Paused')
+  local jobId = tostring(msg.jobId)
+  
+  ensure(not isEmpty(jobId), 'Missing jobId')
+  
+  local job = jobs[jobId]
+  ensure(job ~= nil, 'Job not found')
+  ensure(job.status == 'funded', 'Job must be in funded status to cancel')
+  ensure(job.freelancer == nil, 'Cannot cancel job with assigned freelancer')
+  ensure(msg.From == job.client, 'Only the client can cancel their job')
+  
+  -- Refund the client directly
+  local success, err = pcall(function()
+    transfer(job.token, job.client, job.amount)
+  end)
+  
+  if not success then
+    error('Transfer failed: ' .. tostring(err))
+  end
+  
+  job.status = 'cancelled'
+  job.cancelledAt = now()
+  
+  emit('JobCancelled', { 
+    jobId = jobId, 
+    status = 'cancelled',
+    by = 'client',
+    client = job.client, 
+    freelancer = job.freelancer, 
+    amount = job.amount 
+  })
 end)
 
 local function ensureCallerIsClient(job, caller)
@@ -232,14 +329,16 @@ local function transfer(token, to, qty)
   ao.send({ Target = token, Action = 'Transfer', To = to, Quantity = tostring(qty) })
 end
 
--- Release: release(jobId) — only client From can call
+-- Release: Releases escrowed funds to the freelancer with optional platform fee
+-- Status: 'locked' → 'released' (final state)
+-- Only the client can call this
 Handlers.add('Release', Handlers.utils.hasMatchingTag('Action', 'Release'), function(msg)
   ensure(not Paused, 'Paused')
   local jobId = tostring(msg.jobId)
   local job = jobs[jobId]
   ensure(job ~= nil, 'Job not found')
-  ensure(job.status == 'locked', 'Job not locked')
-  ensure(msg.From == job.client, 'Only client can perform this action')
+  ensure(job.status == 'locked', 'Job must be locked to release funds')
+  ensure(msg.From == job.client, 'Only client can release funds')
 
   -- in-flight state prevents re-entrancy/double spend
   job.status = 'releasing'
@@ -256,26 +355,45 @@ Handlers.add('Release', Handlers.utils.hasMatchingTag('Action', 'Release'), func
 
   job.status = 'released'
   job.releasedAt = now()
-  emit('Released', { jobId = jobId, amount = amount, fee = fee, payout = payout })
+  emit('Released', { 
+    jobId = jobId, 
+    status = 'released',
+    by = 'client',
+    client = job.client,
+    freelancer = job.freelancer,
+    amount = amount, 
+    fee = fee, 
+    payout = payout 
+  })
 end)
 
--- Refund: refund(jobId) — only client From can call
+-- Refund: Returns escrowed funds to the client
+-- Status: 'locked' → 'refunded' (final state)
+-- Only the client can call this
 Handlers.add('Refund', Handlers.utils.hasMatchingTag('Action', 'Refund'), function(msg)
   ensure(not Paused, 'Paused')
   local jobId = tostring(msg.jobId)
   local job = jobs[jobId]
   ensure(job ~= nil, 'Job not found')
-  ensure(job.status == 'locked', 'Job not locked')
-  ensure(msg.From == job.client, 'Only client can perform this action')
+  ensure(job.status == 'locked', 'Job must be locked to refund')
+  ensure(msg.From == job.client, 'Only client can refund their job')
 
   job.status = 'refunding'
   transfer(job.token, job.client, job.amount)
   job.status = 'refunded'
   job.refundedAt = now()
-  emit('Refunded', { jobId = jobId, amount = job.amount })
+  emit('Refunded', { 
+    jobId = jobId, 
+    status = 'refunded',
+    by = 'client',
+    client = job.client,
+    freelancer = job.freelancer,
+    amount = job.amount 
+  })
 end)
 
--- Dispute: optional - open and decide
+-- OpenDispute: Allows client or freelancer to open a dispute on a locked job
+-- Only works on jobs in 'locked' status (with assigned freelancer)
 Handlers.add('OpenDispute', Handlers.utils.hasMatchingTag('Action', 'OpenDispute'), function(msg)
   ensure(not Paused, 'Paused')
   local jobId = tostring(msg.jobId)
@@ -283,23 +401,34 @@ Handlers.add('OpenDispute', Handlers.utils.hasMatchingTag('Action', 'OpenDispute
   local reason = msg.reason
   local job = jobs[jobId]
   ensure(job ~= nil, 'Job not found')
-  ensure(job.status == 'locked', 'Cannot dispute non-locked job')
+  ensure(job.status == 'locked', 'Cannot dispute job that is not locked')
   ensure(caller == job.client or caller == job.freelancer, 'Only job parties can open dispute')
+  ensure(job.freelancer ~= nil, 'Cannot dispute job without assigned freelancer')
   if type(reason) == 'string' then ensure(#reason <= 1024, 'reason too long') end
   job.dispute = { openedBy = caller, reason = reason, openedAt = now() }
-  emit('DisputeOpened', { jobId = jobId, by = caller, reason = reason })
+  emit('DisputeOpened', { 
+    jobId = jobId, 
+    status = job.status, -- remains 'locked'
+    by = (caller == job.client) and 'client' or 'freelancer',
+    client = job.client,
+    freelancer = job.freelancer,
+    amount = job.amount,
+    reason = reason 
+  })
 end)
 
+-- DecideDispute: Allows arbiter to resolve disputes by releasing or refunding
+-- Can transition 'locked' → 'released' or 'locked' → 'refunded'
 Handlers.add('DecideDispute', Handlers.utils.hasMatchingTag('Action', 'DecideDispute'), function(msg)
   ensure(not Paused, 'Paused')
   ensure(arbiter ~= nil, 'No arbiter configured')
-  ensure(msg.From == arbiter, 'Only arbiter can decide')
+  ensure(msg.From == arbiter, 'Only arbiter can decide disputes')
   local jobId = tostring(msg.jobId)
   local outcome = msg.outcome -- 'release' or 'refund'
   local job = jobs[jobId]
   ensure(job ~= nil, 'Job not found')
-  ensure(job.status == 'locked', 'Job not locked')
-  ensure(job.dispute ~= nil, 'No dispute open')
+  ensure(job.status == 'locked', 'Job must be locked to decide dispute')
+  ensure(job.dispute ~= nil, 'No dispute open for this job')
 
   if outcome == 'release' then
     -- Reuse Release logic without client restriction
@@ -309,33 +438,56 @@ Handlers.add('DecideDispute', Handlers.utils.hasMatchingTag('Action', 'DecideDis
     if platformFeeBps and platformFeeBps > 0 and platformTreasury then
       fee = bps(amount, platformFeeBps)
     end
+    ensure(cmp(amount, fee) >= 0, 'Fee exceeds amount')
     local payout = sub(amount, fee)
     if cmp(fee, '0') > 0 then transfer(job.token, platformTreasury, fee) end
     if cmp(payout, '0') > 0 then transfer(job.token, job.freelancer, payout) end
 
     job.status = 'released'
     job.releasedAt = now()
-    emit('Released', { jobId = jobId, amount = amount, fee = fee, payout = payout, by = 'arbiter' })
+    job.dispute = nil -- Clear dispute since job is finalized
+    emit('Released', { 
+      jobId = jobId, 
+      status = 'released',
+      by = 'arbiter',
+      client = job.client,
+      freelancer = job.freelancer,
+      amount = amount, 
+      fee = fee, 
+      payout = payout 
+    })
   elseif outcome == 'refund' then
     job.status = 'refunding'
     transfer(job.token, job.client, job.amount)
     job.status = 'refunded'
     job.refundedAt = now()
-    emit('Refunded', { jobId = jobId, amount = job.amount, by = 'arbiter' })
+    job.dispute = nil -- Clear dispute since job is finalized
+    emit('Refunded', { 
+      jobId = jobId, 
+      status = 'refunded',
+      by = 'arbiter',
+      client = job.client,
+      freelancer = job.freelancer,
+      amount = job.amount 
+    })
   else
-    error('Invalid outcome')
+    error('Invalid outcome: must be "release" or "refund"')
   end
 end)
 
--- Timeout: freelancer can claim if client inactive and timeout passed
+-- ClaimTimeout: Allows freelancer to claim payment after client inactivity timeout
+-- Only works on jobs in 'locked' status after timeout period has passed
+-- Timeout is calculated from when freelancer was assigned, not when job was created
 Handlers.add('ClaimTimeout', Handlers.utils.hasMatchingTag('Action', 'ClaimTimeout'), function(msg)
   ensure(not Paused, 'Paused')
   ensure(timeoutSecs and timeoutSecs > 0, 'Timeouts disabled')
   local jobId = tostring(msg.jobId)
   local job = jobs[jobId]
   ensure(job ~= nil, 'Job not found')
-  ensure(job.status == 'locked', 'Job not locked')
-  ensure((now() - job.createdAt) >= timeoutSecs, 'Timeout not reached')
+  ensure(job.status == 'locked', 'Job must be locked to claim timeout')
+  ensure(job.freelancer ~= nil, 'Job must have assigned freelancer to claim timeout')
+  ensure(job.assignedAt ~= nil, 'Job missing assignment timestamp')
+  ensure((now() - job.assignedAt) >= timeoutSecs, 'Timeout period not yet reached since freelancer assignment')
 
   job.status = 'releasing'
   local amount = job.amount
@@ -343,40 +495,55 @@ Handlers.add('ClaimTimeout', Handlers.utils.hasMatchingTag('Action', 'ClaimTimeo
   if platformFeeBps and platformFeeBps > 0 and platformTreasury then
     fee = bps(amount, platformFeeBps)
   end
+  ensure(cmp(amount, fee) >= 0, 'Fee exceeds amount')
   local payout = sub(amount, fee)
   if cmp(fee, '0') > 0 then transfer(job.token, platformTreasury, fee) end
   if cmp(payout, '0') > 0 then transfer(job.token, job.freelancer, payout) end
 
   job.status = 'released'
   job.releasedAt = now()
-  emit('Released', { jobId = jobId, amount = amount, fee = fee, payout = payout, by = 'timeout' })
+  emit('Released', { 
+    jobId = jobId, 
+    status = 'released',
+    by = 'timeout',
+    client = job.client,
+    freelancer = job.freelancer,
+    amount = amount, 
+    fee = fee, 
+    payout = payout 
+  })
 end)
 
--- Admin: reset a job stuck in in-flight state back to locked (no token transfers)
+-- AdminResetJob: Emergency function to reset jobs stuck in transition states
+-- Resets 'releasing' or 'refunding' status back to 'locked' (no token transfers)
 Handlers.add('AdminResetJob', Handlers.utils.hasMatchingTag('Action', 'AdminResetJob'), function(msg)
-  ensure(Owner ~= nil and msg.From == Owner, 'Unauthorized')
+  ensure(Owner ~= nil and msg.From == Owner, 'Unauthorized: only owner can reset jobs')
   local jobId = tostring(msg.jobId)
   local job = jobs[jobId]
   ensure(job ~= nil, 'Job not found')
-  ensure(job.status == 'releasing' or job.status == 'refunding', 'Job not in in-flight state')
+  ensure(job.status == 'releasing' or job.status == 'refunding', 'Job not in transition state')
   job.status = 'locked'
   emit('JobReset', { jobId = jobId })
 end)
 
--- Admin: transfer ownership
+-- TransferOwnership: Allows current owner to transfer ownership to a new address
 Handlers.add('TransferOwnership', Handlers.utils.hasMatchingTag('Action', 'TransferOwnership'), function(msg)
-  ensure(Owner ~= nil and msg.From == Owner, 'Unauthorized')
-  ensure(not isEmpty(msg.newOwner), 'Missing newOwner')
+  ensure(Owner ~= nil and msg.From == Owner, 'Unauthorized: only current owner can transfer ownership')
+  ensure(not isEmpty(msg.newOwner), 'Missing newOwner address')
   Owner = msg.newOwner
   emit('OwnerSet', { owner = Owner })
 end)
 
--- Views
+-- View handlers: GetConfig, ListAllowedTokens, ListJobs
+-- These provide read-only access to contract state
+
+-- GetConfig: Returns current contract configuration
 Handlers.add('GetConfig', Handlers.utils.hasMatchingTag('Action', 'GetConfig'), function(msg)
   local cfg = { Owner = Owner, Paused = Paused, platformFeeBps = platformFeeBps, platformTreasury = platformTreasury, arbiter = arbiter, timeoutSecs = timeoutSecs }
   ao.send({ Target = msg.From, Action = 'GetConfigResult', Data = json.encode(cfg) })
 end)
 
+-- ListAllowedTokens: Returns list of allowed token addresses
 Handlers.add('ListAllowedTokens', Handlers.utils.hasMatchingTag('Action', 'ListAllowedTokens'), function(msg)
   local list = {}
   for t, v in pairs(allowedTokens) do
@@ -385,7 +552,7 @@ Handlers.add('ListAllowedTokens', Handlers.utils.hasMatchingTag('Action', 'ListA
   ao.send({ Target = msg.From, Action = 'ListAllowedTokensResult', Data = json.encode(list) })
 end)
 
--- List jobs (basic pagination)
+-- ListJobs: Returns paginated list of jobs with basic information
 Handlers.add('ListJobs', Handlers.utils.hasMatchingTag('Action', 'ListJobs'), function(msg)
   local res = {}
   local count = 0
