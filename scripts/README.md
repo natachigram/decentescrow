@@ -12,14 +12,21 @@ Minimal Node scripts for interacting with the escrow via `@permaweb/aoconnect`.
 
 ## Usage
 
-- Approve (optional, if token requires):
-  - `QTY=1000000 npm run approve`
-- Deposit:
-  - `AMOUNT=1000000 JOB_ID=job-1 npm run deposit`
-- Release:
+End-to-end (client → assign → settle):
+
+- Approve (client grants escrow allowance; if token enforces approvals)
+  - `QTY=1000000000000000000 npm run approve`
+- Deposit (client funds job; no freelancer yet)
+  - `AMOUNT=1000000000000000000 JOB_ID=job-1 npm run deposit`
+- Assign freelancer (client locks job)
+  - `FREELANCER=<address> JOB_ID=job-1 npm run assign`
+- Release funds (client settles to freelancer; credits pending)
   - `JOB_ID=job-1 npm run release`
-- Refund:
+- Refund (client refunds self; credits pending)
   - `JOB_ID=job-1 npm run refund`
+- Claim pending (recipient pulls funds; token defaults to configured)
+  - `npm run claim`
+  - or specify: `TOKEN=<processId> AMOUNT=... npm run claim`
 
 ### Bootstrap (owner + default token + config)
 
@@ -34,6 +41,9 @@ This will:
 - Set default token (auto-allow)
 - Explicitly allow token
 - Apply platform fee/treasury/arbiter/timeout if present in config
+
+Additional owner ops:
+- Cancel unassigned job (client only): `JOB_ID=job-1 npm run cancel`
 
 ### Admin
 

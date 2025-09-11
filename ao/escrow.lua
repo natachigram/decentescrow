@@ -4,6 +4,7 @@ local json = require('json')
 
 -- State
 local jobs = jobs or {}               -- jobId => { client, freelancer, token, amount (string), status, createdAt, meta, dispute }
+local pending = pending or {}         -- addr => { [token] = amount (string) }
 local platformFeeBps = platformFeeBps or 0 -- basis points (1% = 100 bps)
 local platformTreasury = platformTreasury or nil
 local arbiter = arbiter or nil        -- optional arbiter address able to decide disputes
@@ -13,6 +14,15 @@ local Paused = Paused or false
 local allowedTokens = allowedTokens or {} -- set of token process IDs
 local defaultToken = defaultToken or nil   -- optional default token process ID
 local enforceAllowlist = enforceAllowlist or false -- once enabled, always enforced
+
+-- Initialize DAT token in allowlist if not already set
+local DAT_TOKEN = 'Ve4nk2QjJK9UGNmV_edrsfhFtDq9FkS8TcOkJ0zKN9I'
+if allowedTokens[DAT_TOKEN] == nil then
+  allowedTokens[DAT_TOKEN] = true
+  if defaultToken == nil then
+    defaultToken = DAT_TOKEN
+  end
+end
 
 -- Helpers
 local function now()
@@ -115,6 +125,26 @@ local function bps(amountStr, bpsVal)
   return q
 end
 
+-- Pending balances helpers
+local function credit(addr, token, amountStr)
+  if pending[addr] == nil then pending[addr] = {} end
+  local cur = pending[addr][token] or '0'
+  pending[addr][token] = add(cur, amountStr)
+end
+
+local function getPending(addr, token)
+  local tmap = pending[addr]
+  if not tmap then return '0' end
+  return tmap[token] or '0'
+end
+
+local function deduct(addr, token, amountStr)
+  local cur = getPending(addr, token)
+  ensure(cmp(cur, amountStr) >= 0, 'Insufficient pending balance')
+  local nextAmt = sub(cur, amountStr)
+  pending[addr][token] = nextAmt
+end
+
 -- Configuration actions
 Handlers.add('InitOwner', Handlers.utils.hasMatchingTag('Action', 'InitOwner'), function(msg)
   ensure(Owner == nil, 'Owner already set')
@@ -124,7 +154,11 @@ end)
 
 Handlers.add('SetConfig', Handlers.utils.hasMatchingTag('Action', 'SetConfig'), function(msg)
   ensure(Owner ~= nil and msg.From == Owner, 'Unauthorized')
-  if msg.platformFeeBps ~= nil then platformFeeBps = safeToNumber(msg.platformFeeBps) end
+  if msg.platformFeeBps ~= nil then
+    local bpsVal = safeToNumber(msg.platformFeeBps)
+    ensure(bpsVal >= 0 and bpsVal <= 10000, 'platformFeeBps out of range [0,10000]')
+    platformFeeBps = bpsVal
+  end
   if not isEmpty(msg.platformTreasury) then platformTreasury = msg.platformTreasury end
   if not isEmpty(msg.arbiter) then arbiter = msg.arbiter end
   if msg.timeoutSecs ~= nil then timeoutSecs = safeToNumber(msg.timeoutSecs) end
@@ -220,15 +254,22 @@ Handlers.add('Deposit', Handlers.utils.hasMatchingTag('Action', 'Deposit'), func
 
   -- Pull funds from client to this process. Prefer TransferFrom if supported, else require client to pre-transfer.
   -- We optimistically try TransferFrom and fall back if token errors. In AO, failures throw; caller should pre-approve.
-  ao.send({
-    Target = token,
-    Action = 'TransferFrom',
-    From = client,
-    To = ao.id,
-    Quantity = tostring(amount),
-    -- Some tokens expect tags: Caller = ao.id or Spender = ao.id
-    Spender = ao.id,
-  })
+  local ok, err = pcall(function()
+    ao.send({
+      Target = token,
+      Action = 'TransferFrom',
+      From = client,
+      To = ao.id,
+      Quantity = tostring(amount),
+      -- Some tokens expect tags: Caller = ao.id or Spender = ao.id
+      Spender = ao.id,
+    })
+  end)
+
+  if not ok then
+    emit('TransferFailed', { stage = 'Deposit', jobId = jobId, reason = tostring(err) })
+    error('TransferFrom failed')
+  end
 
   jobs[jobId] = {
     client = client,
@@ -299,14 +340,8 @@ Handlers.add('CancelUnassigned', Handlers.utils.hasMatchingTag('Action', 'Cancel
   ensure(job.freelancer == nil, 'Cannot cancel job with assigned freelancer')
   ensure(msg.From == job.client, 'Only the client can cancel their job')
   
-  -- Refund the client directly
-  local success, err = pcall(function()
-    transfer(job.token, job.client, job.amount)
-  end)
-  
-  if not success then
-    error('Transfer failed: ' .. tostring(err))
-  end
+  -- Credit refund to client's pending balance instead of pushing
+  credit(job.client, job.token, job.amount)
   
   job.status = 'cancelled'
   job.cancelledAt = now()
@@ -326,6 +361,7 @@ local function ensureCallerIsClient(job, caller)
 end
 
 local function transfer(token, to, qty)
+  -- pcall wrapper is used by claim to avoid state mutations on failure
   ao.send({ Target = token, Action = 'Transfer', To = to, Quantity = tostring(qty) })
 end
 
@@ -350,8 +386,9 @@ Handlers.add('Release', Handlers.utils.hasMatchingTag('Action', 'Release'), func
   ensure(cmp(amount, fee) >= 0, 'Fee exceeds amount')
   local payout = sub(amount, fee)
 
-  if cmp(fee, '0') > 0 then transfer(job.token, platformTreasury, fee) end
-  if cmp(payout, '0') > 0 then transfer(job.token, job.freelancer, payout) end
+  -- Credit pending balances for pull-based claims
+  if cmp(fee, '0') > 0 then credit(platformTreasury, job.token, fee) end
+  if cmp(payout, '0') > 0 then credit(job.freelancer, job.token, payout) end
 
   job.status = 'released'
   job.releasedAt = now()
@@ -363,7 +400,8 @@ Handlers.add('Release', Handlers.utils.hasMatchingTag('Action', 'Release'), func
     freelancer = job.freelancer,
     amount = amount, 
     fee = fee, 
-    payout = payout 
+    payout = payout,
+    mode = 'pull'
   })
 end)
 
@@ -379,7 +417,8 @@ Handlers.add('Refund', Handlers.utils.hasMatchingTag('Action', 'Refund'), functi
   ensure(msg.From == job.client, 'Only client can refund their job')
 
   job.status = 'refunding'
-  transfer(job.token, job.client, job.amount)
+  -- Credit refund to client's pending balance
+  credit(job.client, job.token, job.amount)
   job.status = 'refunded'
   job.refundedAt = now()
   emit('Refunded', { 
@@ -388,7 +427,8 @@ Handlers.add('Refund', Handlers.utils.hasMatchingTag('Action', 'Refund'), functi
     by = 'client',
     client = job.client,
     freelancer = job.freelancer,
-    amount = job.amount 
+    amount = job.amount,
+    mode = 'pull'
   })
 end)
 
@@ -440,8 +480,8 @@ Handlers.add('DecideDispute', Handlers.utils.hasMatchingTag('Action', 'DecideDis
     end
     ensure(cmp(amount, fee) >= 0, 'Fee exceeds amount')
     local payout = sub(amount, fee)
-    if cmp(fee, '0') > 0 then transfer(job.token, platformTreasury, fee) end
-    if cmp(payout, '0') > 0 then transfer(job.token, job.freelancer, payout) end
+    if cmp(fee, '0') > 0 then credit(platformTreasury, job.token, fee) end
+    if cmp(payout, '0') > 0 then credit(job.freelancer, job.token, payout) end
 
     job.status = 'released'
     job.releasedAt = now()
@@ -454,11 +494,12 @@ Handlers.add('DecideDispute', Handlers.utils.hasMatchingTag('Action', 'DecideDis
       freelancer = job.freelancer,
       amount = amount, 
       fee = fee, 
-      payout = payout 
+      payout = payout,
+      mode = 'pull'
     })
   elseif outcome == 'refund' then
     job.status = 'refunding'
-    transfer(job.token, job.client, job.amount)
+    credit(job.client, job.token, job.amount)
     job.status = 'refunded'
     job.refundedAt = now()
     job.dispute = nil -- Clear dispute since job is finalized
@@ -468,7 +509,8 @@ Handlers.add('DecideDispute', Handlers.utils.hasMatchingTag('Action', 'DecideDis
       by = 'arbiter',
       client = job.client,
       freelancer = job.freelancer,
-      amount = job.amount 
+      amount = job.amount,
+      mode = 'pull'
     })
   else
     error('Invalid outcome: must be "release" or "refund"')
@@ -497,8 +539,8 @@ Handlers.add('ClaimTimeout', Handlers.utils.hasMatchingTag('Action', 'ClaimTimeo
   end
   ensure(cmp(amount, fee) >= 0, 'Fee exceeds amount')
   local payout = sub(amount, fee)
-  if cmp(fee, '0') > 0 then transfer(job.token, platformTreasury, fee) end
-  if cmp(payout, '0') > 0 then transfer(job.token, job.freelancer, payout) end
+  if cmp(fee, '0') > 0 then credit(platformTreasury, job.token, fee) end
+  if cmp(payout, '0') > 0 then credit(job.freelancer, job.token, payout) end
 
   job.status = 'released'
   job.releasedAt = now()
@@ -510,7 +552,8 @@ Handlers.add('ClaimTimeout', Handlers.utils.hasMatchingTag('Action', 'ClaimTimeo
     freelancer = job.freelancer,
     amount = amount, 
     fee = fee, 
-    payout = payout 
+    payout = payout,
+    mode = 'pull'
   })
 end)
 
@@ -563,4 +606,42 @@ Handlers.add('ListJobs', Handlers.utils.hasMatchingTag('Action', 'ListJobs'), fu
     if count >= limit then break end
   end
   ao.send({ Target = msg.From, Action = 'ListJobsResult', Data = json.encode(res) })
+end)
+
+-- View: GetPending for an address (defaults to caller)
+Handlers.add('GetPending', Handlers.utils.hasMatchingTag('Action', 'GetPending'), function(msg)
+  local addr = msg.addr or msg.From
+  local res = {}
+  if pending[addr] then
+    for t, amt in pairs(pending[addr]) do
+      table.insert(res, { token = t, amount = amt })
+    end
+  end
+  ao.send({ Target = msg.From, Action = 'GetPendingResult', Address = addr, Data = json.encode(res) })
+end)
+
+-- Claim: withdraw pending funds for caller (single token per call)
+-- Params: token, amount (optional; defaults to full)
+Handlers.add('Claim', Handlers.utils.hasMatchingTag('Action', 'Claim'), function(msg)
+  ensure(not Paused, 'Paused')
+  local claimant = msg.From
+  local token = msg.token or defaultToken
+  ensure(not isEmpty(token), 'Missing token')
+  local available = getPending(claimant, token)
+  ensure(cmp(available, '0') > 0, 'Nothing to claim')
+  local amount = tostring(msg.amount or available)
+  ensure(isDigits(amount) and cmp(amount, '0') > 0, 'Invalid amount')
+  ensure(cmp(available, amount) >= 0, 'Amount exceeds pending')
+
+  -- Attempt transfer; only deduct on success
+  local ok, err = pcall(function()
+    transfer(token, claimant, amount)
+  end)
+  if not ok then
+    emit('TransferFailed', { stage = 'Claim', address = claimant, token = token, amount = amount, reason = tostring(err) })
+    return
+  end
+
+  deduct(claimant, token, amount)
+  emit('Claimed', { address = claimant, token = token, amount = amount })
 end)

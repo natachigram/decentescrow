@@ -3,18 +3,11 @@ import { loadConfig, send } from './utils.js';
 async function main() {
   const cfg = loadConfig();
   const jobId = process.env.JOB_ID || 'job-1';
-  const freelancer = process.env.FREELANCER || cfg.FREELANCER_ADDRESS;
   if (!cfg.ESCROW_PROCESS_ID)
     throw new Error('Missing ESCROW_PROCESS_ID in config');
-  if (!freelancer)
-    throw new Error(
-      'Provide FREELANCER env or set FREELANCER_ADDRESS in config'
-    );
-
   await send(cfg.ESCROW_PROCESS_ID, [
-    { name: 'Action', value: 'AssignFreelancer' },
+    { name: 'Action', value: 'CancelUnassigned' },
     { name: 'jobId', value: jobId },
-    { name: 'freelancer', value: freelancer },
   ]);
 }
 

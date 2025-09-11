@@ -1,0 +1,5 @@
+{
+  "devDependencies": {
+    "ao-deploy": "^0.9.1"
+  }
+}

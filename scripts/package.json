@@ -9,10 +9,13 @@
     },
     "scripts": {
         "deposit": "node deposit.js",
+        "assign": "node assign.js",
         "release": "node release.js",
         "refund": "node refund.js",
         "approve": "node approve.js",
         "admin": "node admin.js",
-        "bootstrap": "node bootstrap.js"
+        "bootstrap": "node bootstrap.js",
+        "claim": "node claim.js",
+        "cancel": "node cancel.js"
     }
 }

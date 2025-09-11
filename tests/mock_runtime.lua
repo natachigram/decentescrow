@@ -17,11 +17,27 @@ ao = {
   id = 'ESCROW_PROCESS_ID',
   emitted = {},
   sent = {},
+  _failRules = {},
   emit = function(event, payload)
     table.insert(ao.emitted, { event = event, payload = payload })
   end,
   send = function(msg)
+    -- allow tests to simulate failures
+    if ao._failRules and #ao._failRules > 0 then
+      for _,rule in ipairs(ao._failRules) do
+        local shouldFail = false
+        local ok, res = pcall(rule, msg)
+        if ok then shouldFail = res else shouldFail = false end
+        if shouldFail then error('Simulated send failure') end
+      end
+    end
     table.insert(ao.sent, msg)
+  end,
+  addFailRule = function(rule)
+    table.insert(ao._failRules, rule)
+  end,
+  clearFailRules = function()
+    ao._failRules = {}
   end
 }
 
@@ -44,6 +60,11 @@ local jsonMock = {
       return table.concat(parts)
     end
     return tostring(tbl)
+  end,
+  decode = function(str)
+    local ok, cjson = pcall(require, 'cjson')
+    if ok and cjson then return cjson.decode(str) end
+    error('json.decode not available in mock without cjson')
   end
 }
 
