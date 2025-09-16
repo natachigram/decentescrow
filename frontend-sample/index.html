@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Escrow Frontend Sample</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu,
+          Cantarell, Noto Sans, Helvetica, Arial, 'Apple Color Emoji',
+          'Segoe UI Emoji';
+        margin: 2rem;
+      }
+      fieldset {
+        margin-bottom: 1rem;
+      }
+      label {
+        display: block;
+        margin: 0.25rem 0;
+      }
+      input {
+        width: 360px;
+        max-width: 100%;
+        padding: 0.4rem;
+      }
+      button {
+        padding: 0.5rem 0.9rem;
+        margin-right: 0.5rem;
+      }
+      code {
+        background: #f4f4f5;
+        padding: 0.15rem 0.3rem;
+        border-radius: 4px;
+      }
+      .row {
+        margin: 0.5rem 0;
+      }
+      .muted {
+        color: #6b7280;
+      }
+      #log {
+        white-space: pre-wrap;
+        background: #0b1020;
+        color: #e2e8f0;
+        padding: 1rem;
+        border-radius: 6px;
+        min-height: 140px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Escrow Frontend Sample</h1>
+    <p class="muted">
+      Connect Wander/ArConnect and create an escrow by signing client-side. Uses
+      Arweave Wallet Standard + @permaweb/aoconnect.
+    </p>
+
+    <fieldset>
+      <legend>Wallet</legend>
+      <div class="row">
+        <button id="btn-connect">Connect Wallet</button>
+        <button id="btn-disconnect">Disconnect</button>
+      </div>
+      <div class="row">Status: <code id="walletStatus">not detected</code></div>
+      <div class="row">Address: <code id="addr">-</code></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Permissions</legend>
+      <div class="row">
+        <button id="btn-perm-dataitem">Request SIGN_DATA_ITEM</button>
+        <button id="btn-perm-tx">Request SIGN_TRANSACTION</button>
+        <button id="btn-perm-list">Show Granted</button>
+      </div>
+      <div class="row" id="perm-list" class="muted"></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Config</legend>
+      <label
+        >Escrow Process ID
+        <input id="escrowPid" placeholder="ESCROW_PROCESS_ID"
+      /></label>
+      <label
+        >Token Process ID <input id="tokenPid" placeholder="TOKEN_PROCESS_ID"
+      /></label>
+      <div class="row muted">These are public IDs; no secrets.</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Create Escrow (Approve + Deposit)</legend>
+      <label>Job ID <input id="jobId" value="job-1" /></label>
+      <label>Amount (smallest unit) <input id="amount" value="0" /></label>
+      <label
+        >Meta (optional, &lt;= 2048 chars)
+        <input id="meta" placeholder='{"note":"optional"}'
+      /></label>
+      <div class="row">
+        <button id="btn-approve">Approve Allowance</button>
+        <button id="btn-deposit">Deposit</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Release / Refund</legend>
+      <label>Job ID <input id="jobId2" value="job-1" /></label>
+      <div class="row">
+        <button id="btn-release">Release</button>
+        <button id="btn-refund">Refund</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Assign Freelancer</legend>
+      <label>Job ID <input id="jobId3" value="job-1" /></label>
+      <label
+        >Freelancer Address
+        <input id="freelancerAddr" placeholder="arweave-address"
+      /></label>
+      <div class="row">
+        <button id="btn-assign">Assign</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Claim Pending</legend>
+      <label
+        >Token (optional, default token if blank) <input id="claimToken"
+      /></label>
+      <label>Amount (optional, blank = full) <input id="claimAmount" /></label>
+      <div class="row">
+        <button id="btn-claim">Claim</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Verify (Read-Only)</legend>
+      <label>Job ID <input id="vJobId" value="job-1" /></label>
+      <div class="row">
+        <button id="btn-get-job">Fetch Job</button>
+      </div>
+      <label
+        >Address (optional)
+        <input id="vAddr" placeholder="defaults to caller on chain"
+      /></label>
+      <label
+        >Token (optional)
+        <input id="vToken" placeholder="default token on chain"
+      /></label>
+      <div class="row">
+        <button id="btn-get-pending">Fetch Pending</button>
+      </div>
+    </fieldset>
+
+    <h3>Log</h3>
+    <div id="log"></div>
+
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

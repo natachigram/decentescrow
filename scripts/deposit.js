@@ -13,7 +13,6 @@ async function main() {
   await send(cfg.ESCROW_PROCESS_ID, [
     { name: 'Action', value: 'Deposit' },
     { name: 'jobId', value: jobId },
-    { name: 'client', value: cfg.CLIENT_ADDRESS },
     { name: 'token', value: cfg.TOKEN_PROCESS_ID },
     { name: 'amount', value: String(amount) },
     ...(meta ? [{ name: 'meta', value: meta }] : []),

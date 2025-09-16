@@ -5,6 +5,6 @@
     "PLATFORM_FEE_BPS": 200,
     "ARBITER": null,
     "TIMEOUT_SECS": 86400,
-    "CLIENT_ADDRESS": "addr1",
-    "FREELANCER_ADDRESS": "addr2"
+    "CLIENT_ADDRESS": "arweave-address-of-client",
+    "FREELANCER_ADDRESS": "arweave-address-of-freelancer"
 }
