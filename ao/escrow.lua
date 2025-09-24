@@ -1,48 +1,50 @@
-
-
+-- DecentEscrow AO
 local json = require('json')
 
--- State
-local jobs = jobs or {}               -- jobId => { client, freelancer, token, amount (string), status, createdAt, meta, dispute }
-local pending = pending or {}         -- addr => { [token] = amount (string) }
-local platformFeeBps = platformFeeBps or 0 -- basis points (1% = 100 bps)
-local platformTreasury = platformTreasury or nil
-local arbiter = arbiter or nil        -- optional arbiter address able to decide disputes
-local timeoutSecs = timeoutSecs or 0  -- optional inactivity timeout allowing freelancer claim
-local Owner = Owner or nil            -- set once
+-- =========================
+-- Persistent config/state
+-- =========================
+local Owner = Owner or nil
 local Paused = Paused or false
-local allowedTokens = allowedTokens or {} -- set of token process IDs
-local defaultToken = defaultToken or nil   -- optional default token process ID
-local enforceAllowlist = enforceAllowlist or false -- once enabled, always enforced
+local arbiter = arbiter or nil                 -- arbiter address allowed to decide disputes
+local platformTreasury = platformTreasury or nil
+local platformFeeBps = platformFeeBps or 500   -- default 5% -> 500 bps
+local MAX_PLATFORM_FEE_BPS = 1000              -- owner cannot set more than this (10%)
 
--- Initialize DAT token in allowlist if not already set
-local DAT_TOKEN = 'Ve4nk2QjJK9UGNmV_edrsfhFtDq9FkS8TcOkJ0zKN9I'
-if allowedTokens[DAT_TOKEN] == nil then
-  allowedTokens[DAT_TOKEN] = true
-  if defaultToken == nil then
-    defaultToken = DAT_TOKEN
-  end
-end
+-- AR token process id. Replace with testnet AR token process id if required by your environment.
+local AR_TOKEN = 'agYcCFJtrMG6cqMuZfskIkFTGvUPddICmtQSBIoPdiA'     
+local defaultToken = AR_TOKEN
 
--- Helpers
-local function now()
-  return tonumber(os.time())
-end
+-- Jobs and tombstones
+local jobs = jobs or {}                        -- jobId -> job object
+local usedJobIds = usedJobIds or {}            -- jobId -> true once ever used
+
+-- pending balances for pull payouts: pending[addr][token] = amountStr
+local pending = pending or {}
 
 local EVENT_VERSION = 1
+
+-- =========================
+-- Utilities & large-int math
+-- =========================
+local function now() return tonumber(os.time()) end
+
 local function emit(event, data)
   data = data or {}
   data._v = EVENT_VERSION
-  ao.emit(event, json.encode(data))
+  if ao.emit then
+    ao.emit(event, json.encode(data))
+  else
+    ao.send({ Target = ao.id, Action = 'Event', Event = event, Data = json.encode(data) })
+  end
 end
 
 local function ensure(cond, msg)
   if not cond then error(msg) end
 end
 
-local function isEmpty(x)
-  return x == nil or x == ''
-end
+local function isEmpty(x) return x == nil or x == '' end
+local function isValidAddr(a) return type(a) == 'string' and #a > 10 end
 
 local function safeToNumber(x)
   local n = tonumber(x)
@@ -50,20 +52,29 @@ local function safeToNumber(x)
   return n
 end
 
--- Big-int string math (non-negative integers only)
+-- Read a tag value from msg or msg.Tags list
+local function getTag(msg, key)
+  local direct = msg[key]
+  if direct ~= nil and direct ~= '' then return direct end
+  local tags = msg.Tags or msg.tags
+  if type(tags) == 'table' then
+    for _, t in ipairs(tags) do
+      if t and t.name == key then
+        return t.value
+      end
+    end
+  end
+  return nil
+end
+
+-- string big-int helpers (non-negative integers only)
 local function isDigits(s) return type(s) == 'string' and s:match('^%d+$') ~= nil end
-local function trimZeros(s)
-  local t = s:gsub('^0+', '')
-  return (#t == 0) and '0' or t
-end
-local function cmp(a,b)
-  a, b = trimZeros(a), trimZeros(b)
-  if #a ~= #b then return (#a > #b) and 1 or -1 end
-  if a == b then return 0 end
-  return (a > b) and 1 or -1
-end
+local function trimZeros(s) local t = s:gsub('^0+','') return (#t==0) and '0' or t end
+local function cmp(a,b) a,b = trimZeros(a), trimZeros(b) if #a ~= #b then return (#a > #b) and 1 or -1 end if a==b then return 0 end return (a>b) and 1 or -1 end
+
 local function add(a,b)
-  a, b = a:reverse(), b:reverse()
+  a,b = trimZeros(a), trimZeros(b)
+  a,b = a:reverse(), b:reverse()
   local carry, out = 0, {}
   local n = math.max(#a,#b)
   for i=1,n do
@@ -76,10 +87,11 @@ local function add(a,b)
   if carry > 0 then table.insert(out, tostring(carry)) end
   return trimZeros(table.concat(out):reverse())
 end
+
 local function sub(a,b)
-  -- assumes a>=b
-  ensure(cmp(a,b) >= 0, ' underflow')
-  a, b = a:reverse(), b:reverse()
+  ensure(cmp(a,b) >= 0, 'underflow')
+  a,b = trimZeros(a), trimZeros(b)
+  a,b = a:reverse(), b:reverse()
   local borrow, out = 0, {}
   local n = math.max(#a,#b)
   for i=1,n do
@@ -91,7 +103,10 @@ local function sub(a,b)
   end
   return trimZeros(table.concat(out):reverse())
 end
+
 local function mulSmall(a,m)
+  ensure(isDigits(a), 'mulSmall expects digits string')
+  ensure(type(m)=='number' and m >= 0, 'mulSmall multiplier invalid')
   local carry, out = 0, {}
   a = a:reverse()
   for i=1,#a do
@@ -106,8 +121,10 @@ local function mulSmall(a,m)
   end
   return trimZeros(table.concat(out):reverse())
 end
+
 local function divSmall(a,d)
-  ensure(d > 0, 'div by zero')
+  ensure(isDigits(a), 'divSmall expects digits string')
+  ensure(type(d)=='number' and d > 0, 'divSmall divisor invalid')
   local out, rem = {}, 0
   for i=1,#a do
     local digit = tonumber(a:sub(i,i))
@@ -118,15 +135,19 @@ local function divSmall(a,d)
   end
   return trimZeros(table.concat(out)), rem
 end
+
 local function bps(amountStr, bpsVal)
-  -- fee = floor(amount * bps / 10000)
+  ensure(isDigits(amountStr), 'bps expects digits string')
   local prod = mulSmall(amountStr, bpsVal)
-  local q = divSmall(prod, 10000)
+  local q, _ = divSmall(prod, 10000)
   return q
 end
 
--- Pending balances helpers
+-- pending accounting
 local function credit(addr, token, amountStr)
+  ensure(not isEmpty(addr), 'credit missing addr')
+  ensure(not isEmpty(token), 'credit missing token')
+  ensure(isDigits(amountStr) and cmp(amountStr,'0') >= 0, 'credit invalid amount')
   if pending[addr] == nil then pending[addr] = {} end
   local cur = pending[addr][token] or '0'
   pending[addr][token] = add(cur, amountStr)
@@ -142,298 +163,305 @@ local function deduct(addr, token, amountStr)
   local cur = getPending(addr, token)
   ensure(cmp(cur, amountStr) >= 0, 'Insufficient pending balance')
   local nextAmt = sub(cur, amountStr)
+  if pending[addr] == nil then pending[addr] = {} end
   pending[addr][token] = nextAmt
 end
 
--- Configuration actions
+-- =========================
+-- Token transfer wrappers
+-- NOTE: Modified to use direct Transfer instead of TransferFrom for tARIO compatibility
+-- =========================
+local function tokenTransfer(token, to, qty)
+  ensure(not isEmpty(token), 'token missing')
+  ensure(not isEmpty(to), 'to missing')
+  ensure(isDigits(qty) and cmp(qty,'0') > 0, 'qty must be positive digits string')
+  local ok, ret = pcall(function()
+    return ao.send({
+      Target = token,
+      Action = 'Transfer',
+      To = to,
+      Quantity = tostring(qty),
+    })
+  end)
+  if not ok then return false, tostring(ret) end
+  if ret == nil or ret == false or tostring(ret) == 'false' then
+    return false, tostring(ret)
+  end
+  return true, ret
+end
+
+-- Token balance tracking for deposit verification
+local receivedTokens = receivedTokens or {} -- token -> sender -> amount (temporary tracking)
+
+-- Handler to receive token transfers
+Handlers.add('Credit-Notice', Handlers.utils.hasMatchingTag('Action', 'Credit-Notice'), function(msg)
+  local token = msg.From -- The token process sending the credit notice
+  local sender = getTag(msg, 'Sender') or msg.Sender
+  local quantity = getTag(msg, 'Quantity') or msg.Quantity
+  
+  if not sender or not quantity then return end
+  
+  -- Track received tokens for deposit verification
+  if receivedTokens[token] == nil then receivedTokens[token] = {} end
+  if receivedTokens[token][sender] == nil then receivedTokens[token][sender] = '0' end
+  
+  receivedTokens[token][sender] = add(receivedTokens[token][sender], quantity)
+  
+  emit('TokenReceived', { 
+    token = token, 
+    sender = sender, 
+    quantity = quantity, 
+    total = receivedTokens[token][sender]
+  })
+end)
+
+-- Helper function to check and consume received tokens
+local function consumeReceivedTokens(token, sender, amount)
+  if receivedTokens[token] == nil or receivedTokens[token][sender] == nil then
+    return false, 'No tokens received from sender'
+  end
+  
+  local available = receivedTokens[token][sender]
+  if cmp(available, amount) < 0 then
+    return false, 'Insufficient tokens received'
+  end
+  
+  -- Consume the tokens
+  receivedTokens[token][sender] = sub(available, amount)
+  return true, 'Tokens consumed'
+end
+
+-- =========================
+-- State helpers
+-- =========================
+local function isFinalState(status)
+  return status == 'released' or status == 'refunded' or status == 'cancelled'
+end
+
+local function assertOwner(caller)
+  ensure(Owner ~= nil and caller == Owner, 'Unauthorized: owner only')
+end
+
+-- =========================
+-- Handlers: Admin & config
+-- =========================
 Handlers.add('InitOwner', Handlers.utils.hasMatchingTag('Action', 'InitOwner'), function(msg)
   ensure(Owner == nil, 'Owner already set')
+  ensure(isValidAddr(msg.From), 'Invalid owner address')
   Owner = msg.From
   emit('OwnerSet', { owner = Owner })
 end)
 
 Handlers.add('SetConfig', Handlers.utils.hasMatchingTag('Action', 'SetConfig'), function(msg)
-  ensure(Owner ~= nil and msg.From == Owner, 'Unauthorized')
-  if msg.platformFeeBps ~= nil then
-    local bpsVal = safeToNumber(msg.platformFeeBps)
-    ensure(bpsVal >= 0 and bpsVal <= 10000, 'platformFeeBps out of range [0,10000]')
+  assertOwner(msg.From)
+  local feeTag = getTag(msg, 'platformFeeBps')
+  local treTag = getTag(msg, 'platformTreasury')
+  local arbTag = getTag(msg, 'arbiter')
+  -- Also accept JSON in msg.Data
+  if type(msg.Data) == 'string' and #msg.Data > 0 then
+    local ok, parsed = pcall(json.decode, msg.Data)
+    if ok and type(parsed) == 'table' then
+      feeTag = parsed.platformFeeBps or feeTag
+      treTag = parsed.platformTreasury or treTag
+      arbTag = parsed.arbiter or arbTag
+    end
+  end
+
+  if feeTag ~= nil and feeTag ~= '' then
+    local bpsVal = safeToNumber(feeTag)
+    ensure(bpsVal >= 0 and bpsVal <= MAX_PLATFORM_FEE_BPS, 'platformFeeBps out of range')
     platformFeeBps = bpsVal
   end
-  if not isEmpty(msg.platformTreasury) then platformTreasury = msg.platformTreasury end
-  if not isEmpty(msg.arbiter) then arbiter = msg.arbiter end
-  if msg.timeoutSecs ~= nil then timeoutSecs = safeToNumber(msg.timeoutSecs) end
-  emit('ConfigUpdated', { platformFeeBps = platformFeeBps, platformTreasury = platformTreasury, arbiter = arbiter, timeoutSecs = timeoutSecs })
+  if not isEmpty(treTag) then
+    ensure(isValidAddr(treTag), 'Invalid platformTreasury')
+    platformTreasury = treTag
+  end
+  if not isEmpty(arbTag) then
+    ensure(isValidAddr(arbTag), 'Invalid arbiter')
+    arbiter = arbTag
+  end
+  emit('ConfigUpdated', { platformFeeBps = platformFeeBps, platformTreasury = platformTreasury, arbiter = arbiter })
 end)
 
 Handlers.add('Pause', Handlers.utils.hasMatchingTag('Action', 'Pause'), function(msg)
-  ensure(Owner ~= nil and msg.From == Owner, 'Unauthorized')
+  assertOwner(msg.From)
   Paused = true
   emit('Paused', { by = msg.From })
 end)
 
 Handlers.add('Unpause', Handlers.utils.hasMatchingTag('Action', 'Unpause'), function(msg)
-  ensure(Owner ~= nil and msg.From == Owner, 'Unauthorized')
+  assertOwner(msg.From)
   Paused = false
   emit('Unpaused', { by = msg.From })
 end)
 
-Handlers.add('AllowToken', Handlers.utils.hasMatchingTag('Action', 'AllowToken'), function(msg)
-  ensure(Owner ~= nil and msg.From == Owner, 'Unauthorized')
-  ensure(not isEmpty(msg.token), 'Missing token')
-  allowedTokens[msg.token] = true
-  enforceAllowlist = true
-  emit('TokenAllowed', { token = msg.token })
+Handlers.add('TransferOwnership', Handlers.utils.hasMatchingTag('Action', 'TransferOwnership'), function(msg)
+  assertOwner(msg.From)
+  ensure(not isEmpty(msg.newOwner), 'Missing newOwner')
+  ensure(isValidAddr(msg.newOwner), 'Invalid newOwner')
+  Owner = msg.newOwner
+  emit('OwnerSet', { owner = Owner })
 end)
 
-Handlers.add('DisallowToken', Handlers.utils.hasMatchingTag('Action', 'DisallowToken'), function(msg)
-  ensure(Owner ~= nil and msg.From == Owner, 'Unauthorized')
-  ensure(not isEmpty(msg.token), 'Missing token')
-  allowedTokens[msg.token] = nil
-  emit('TokenDisallowed', { token = msg.token })
-end)
-
-Handlers.add('SetDefaultToken', Handlers.utils.hasMatchingTag('Action', 'SetDefaultToken'), function(msg)
-  ensure(Owner ~= nil and msg.From == Owner, 'Unauthorized')
-  ensure(not isEmpty(msg.token), 'Missing token')
-  defaultToken = msg.token
-  allowedTokens[defaultToken] = true
-  enforceAllowlist = true
-  emit('DefaultTokenSet', { token = defaultToken })
-end)
-
--- View: GetJob
-Handlers.add('GetJob', Handlers.utils.hasMatchingTag('Action', 'GetJob'), function(msg)
-  local jobId = tostring(msg.jobId)
-  local job = jobs[jobId]
-  ao.send({ Target = msg.From, Action = 'GetJobResult', JobId = jobId, Data = json.encode(job or {}) })
-end)
-
--- Deposit: Creates a new escrow job with funding but no assigned freelancer yet
--- Status: none → 'funded'
--- Parameters: jobId, client, token, amount, meta (optional)
--- Only the client can call this to fund their own job
+-- =========================
+-- Deposit: create new job using received tokens
+-- Two-step process: 1) Client transfers tokens to escrow, 2) Client calls Deposit
+-- This is compatible with tARIO and other direct-transfer tokens
+-- =========================
 Handlers.add('Deposit', Handlers.utils.hasMatchingTag('Action', 'Deposit'), function(msg)
   ensure(not Paused, 'Paused')
-  local jobId = tostring(msg.jobId)
-  local client = msg.client
-  local token = msg.token or defaultToken
-  local amount = tostring(msg.amount or '')
-  local meta = msg.meta -- optional table/string
-
-  -- Check for job ID conflicts - allow reuse only if previous job is in final state
-  local existingJob = jobs[jobId]
-  if existingJob then
-    local finalStates = { cancelled = true, released = true, refunded = true }
-    ensure(finalStates[existingJob.status], 'Job ID already in use by active job')
-    -- Note: Reusing job ID will overwrite the previous job record entirely.
-    -- Previous job history is not preserved in this implementation.
+  local jobId = tostring(getTag(msg, 'jobId') or msg.jobId)
+  local client = msg.From
+  local token = getTag(msg, 'token') or defaultToken
+  local amount = tostring(getTag(msg, 'amount') or msg.amount or '')
+  local meta = getTag(msg, 'meta') or msg.meta
+  if (not meta) and type(msg.Data) == 'string' and #msg.Data > 0 then
+    local ok, parsed = pcall(json.decode, msg.Data)
+    if ok and type(parsed) == 'table' then meta = parsed.meta or meta end
   end
-  
-  ensure(not isEmpty(jobId) and not isEmpty(client) and not isEmpty(token), 'Missing required fields: jobId, client, token')
+
+  ensure(not isEmpty(jobId), 'Missing jobId')
+  ensure(isValidAddr(client), 'Invalid client address')
   ensure(isDigits(amount) and cmp(amount, '0') > 0, 'Amount must be positive integer string')
-  -- Only the client is allowed to initiate a deposit for their job
-  ensure(msg.From == client, 'Only client can deposit for their own job')
-  -- Token allowlist
-  if enforceAllowlist then ensure(allowedTokens[token] == true, 'Token not allowed') end
-  -- Basic limits
-  ensure(#jobId <= 128, 'jobId too long')
-  
-  -- Validate meta size for both string and table types
+  ensure(not usedJobIds[jobId], 'JobId already used')
+  ensure(not isEmpty(token), 'Token not set')
+
   if meta ~= nil then
-    local metaStr
-    if type(meta) == 'string' then
-      metaStr = meta
-    else
-      -- Serialize table to JSON to check size
-      local success, result = pcall(json.encode, meta)
-      ensure(success, 'Invalid meta: cannot serialize to JSON')
-      metaStr = result
+    local mstr
+    if type(meta) == 'string' then mstr = meta else
+      local ok,s = pcall(json.encode, meta)
+      ensure(ok, 'Meta serialization failed')
+      mstr = s
     end
-    ensure(#metaStr <= 2048, 'meta too long (max 2048 characters when serialized)')
+    ensure(#mstr <= 2048, 'meta too long')
   end
 
-  -- Pull funds from client to this process. Prefer TransferFrom if supported, else require client to pre-transfer.
-  -- We optimistically try TransferFrom and fall back if token errors. In AO, failures throw; caller should pre-approve.
-  local ok, err = pcall(function()
-    ao.send({
-      Target = token,
-      Action = 'TransferFrom',
-      From = client,
-      To = ao.id,
-      Quantity = tostring(amount),
-      -- Some tokens expect tags: Caller = ao.id or Spender = ao.id
-      Spender = ao.id,
-    })
-  end)
-
+  -- Check if client has transferred sufficient tokens to escrow
+  local ok, reason = consumeReceivedTokens(token, client, amount)
   if not ok then
-    emit('TransferFailed', { stage = 'Deposit', jobId = jobId, reason = tostring(err) })
-    error('TransferFrom failed')
+    emit('DepositFailed', { 
+      stage = 'TokenVerification', 
+      jobId = jobId, 
+      by = client, 
+      reason = reason,
+      instruction = 'Transfer tokens to escrow first, then call Deposit'
+    })
+    error('Insufficient tokens transferred: ' .. tostring(reason))
   end
 
+  local nowTs = now()
   jobs[jobId] = {
+    jobId = jobId,
     client = client,
-    freelancer = nil, -- No freelancer assigned yet
+    freelancer = nil,
     token = token,
     amount = amount,
-    status = 'funded', -- Job is funded but not yet assigned
-    createdAt = now(),
+    status = 'funded',
+    createdAt = nowTs,
     meta = meta,
     dispute = nil,
+    cancelRequest = nil,     -- for mutual cancel flow
+    cancelApprovedBy = nil,
   }
+  usedJobIds[jobId] = true
 
   emit('Deposited', { 
     jobId = jobId, 
-    status = 'funded',
-    by = 'client',
     client = client, 
-    freelancer = nil, 
-    amount = amount,
-    token = token 
+    amount = amount, 
+    token = token, 
+    createdAt = nowTs,
+    method = 'direct-transfer'
   })
 end)
 
--- AssignFreelancer: Assigns a freelancer to a funded job
--- Status: 'funded' → 'locked'
--- Parameters: jobId, freelancer
--- Only the client of the job can call this
+-- =========================
+-- AssignFreelancer: client assigns freelancer -> locked
+-- =========================
 Handlers.add('AssignFreelancer', Handlers.utils.hasMatchingTag('Action', 'AssignFreelancer'), function(msg)
   ensure(not Paused, 'Paused')
-  local jobId = tostring(msg.jobId)
-  local freelancer = msg.freelancer
-  
+  local jobId = tostring(getTag(msg, 'jobId') or msg.jobId)
+  local freelancer = getTag(msg, 'freelancer') or msg.freelancer
   ensure(not isEmpty(jobId), 'Missing jobId')
-  ensure(not isEmpty(freelancer), 'Missing freelancer')
-  
+  ensure(isValidAddr(freelancer), 'Invalid freelancer address')
+
   local job = jobs[jobId]
   ensure(job ~= nil, 'Job not found')
-  ensure(job.status == 'funded', 'Job must be in funded status to assign freelancer')
-  ensure(msg.From == job.client, 'Only the client can assign freelancer to their job')
-  
-  -- Assign the freelancer and lock the job
+  ensure(job.status == 'funded', 'Job must be funded to assign freelancer')
+  ensure(msg.From == job.client, 'Only client can assign freelancer')
+  ensure(freelancer ~= job.client, 'Client cannot be freelancer')
+
   job.freelancer = freelancer
   job.status = 'locked'
   job.assignedAt = now()
-  
-  emit('FreelancerAssigned', { 
-    jobId = jobId, 
-    status = 'locked',
-    by = 'client',
-    client = job.client,
-    freelancer = freelancer, 
-    amount = job.amount 
-  })
+  emit('FreelancerAssigned', { jobId = jobId, client = job.client, freelancer = freelancer, assignedAt = job.assignedAt })
 end)
 
--- CancelUnassigned: Allows client to cancel and refund a funded job before assigning freelancer
--- Status: 'funded' → 'cancelled' (final state)
--- Only the client can call this and only for unassigned jobs
+-- =========================
+-- CancelUnassigned: client can cancel funded job before assignment -> refund
+-- (keeps previous behavior but explicit)
+-- =========================
 Handlers.add('CancelUnassigned', Handlers.utils.hasMatchingTag('Action', 'CancelUnassigned'), function(msg)
   ensure(not Paused, 'Paused')
   local jobId = tostring(msg.jobId)
-  
   ensure(not isEmpty(jobId), 'Missing jobId')
-  
+
   local job = jobs[jobId]
   ensure(job ~= nil, 'Job not found')
-  ensure(job.status == 'funded', 'Job must be in funded status to cancel')
-  ensure(job.freelancer == nil, 'Cannot cancel job with assigned freelancer')
-  ensure(msg.From == job.client, 'Only the client can cancel their job')
-  
-  -- Credit refund to client's pending balance instead of pushing
+  ensure(job.status == 'funded', 'Job must be funded to cancel')
+  ensure(job.freelancer == nil, 'Cannot cancel job after freelancer assigned')
+  ensure(msg.From == job.client, 'Only client can cancel')
+
   credit(job.client, job.token, job.amount)
-  
   job.status = 'cancelled'
   job.cancelledAt = now()
-  
-  emit('JobCancelled', { 
-    jobId = jobId, 
-    status = 'cancelled',
-    by = 'client',
-    client = job.client, 
-    freelancer = job.freelancer, 
-    amount = job.amount 
-  })
+  emit('JobCancelled', { jobId = jobId, client = job.client, amount = job.amount, cancelledAt = job.cancelledAt })
 end)
 
-local function ensureCallerIsClient(job, caller)
-  ensure(caller == job.client, 'Only client can perform this action')
-end
-
-local function transfer(token, to, qty)
-  -- pcall wrapper is used by claim to avoid state mutations on failure
-  ao.send({ Target = token, Action = 'Transfer', To = to, Quantity = tostring(qty) })
-end
-
--- Release: Releases escrowed funds to the freelancer with optional platform fee
--- Status: 'locked' → 'released' (final state)
--- Only the client can call this
-Handlers.add('Release', Handlers.utils.hasMatchingTag('Action', 'Release'), function(msg)
+-- =========================
+-- Mutual cancel flow for locked jobs:
+-- RequestCancel: either party requests cancellation
+-- ApproveCancel: the counterparty approves; on approval refund to client and finalize cancelled
+-- This prevents a unilateral refund by client after assignment
+-- =========================
+Handlers.add('RequestCancel', Handlers.utils.hasMatchingTag('Action', 'RequestCancel'), function(msg)
   ensure(not Paused, 'Paused')
   local jobId = tostring(msg.jobId)
+  local caller = msg.From
   local job = jobs[jobId]
   ensure(job ~= nil, 'Job not found')
-  ensure(job.status == 'locked', 'Job must be locked to release funds')
-  ensure(msg.From == job.client, 'Only client can release funds')
-
-  -- in-flight state prevents re-entrancy/double spend
-  job.status = 'releasing'
-  local amount = job.amount
-  local fee = '0'
-  if platformFeeBps and platformFeeBps > 0 and platformTreasury then
-    fee = bps(amount, platformFeeBps)
-  end
-  ensure(cmp(amount, fee) >= 0, 'Fee exceeds amount')
-  local payout = sub(amount, fee)
-
-  -- Credit pending balances for pull-based claims
-  if cmp(fee, '0') > 0 then credit(platformTreasury, job.token, fee) end
-  if cmp(payout, '0') > 0 then credit(job.freelancer, job.token, payout) end
-
-  job.status = 'released'
-  job.releasedAt = now()
-  emit('Released', { 
-    jobId = jobId, 
-    status = 'released',
-    by = 'client',
-    client = job.client,
-    freelancer = job.freelancer,
-    amount = amount, 
-    fee = fee, 
-    payout = payout,
-    mode = 'pull'
-  })
+  ensure(job.status == 'locked', 'Can only request cancel when job is locked')
+  ensure(caller == job.client or caller == job.freelancer, 'Only job parties can request cancel')
+  job.cancelRequest = { requestedBy = caller, requestedAt = now() }
+  job.cancelApprovedBy = nil
+  emit('CancelRequested', { jobId = jobId, by = caller, requestedAt = job.cancelRequest.requestedAt })
 end)
 
--- Refund: Returns escrowed funds to the client
--- Status: 'locked' → 'refunded' (final state)
--- Only the client can call this
-Handlers.add('Refund', Handlers.utils.hasMatchingTag('Action', 'Refund'), function(msg)
+Handlers.add('ApproveCancel', Handlers.utils.hasMatchingTag('Action', 'ApproveCancel'), function(msg)
   ensure(not Paused, 'Paused')
   local jobId = tostring(msg.jobId)
+  local caller = msg.From
   local job = jobs[jobId]
   ensure(job ~= nil, 'Job not found')
-  ensure(job.status == 'locked', 'Job must be locked to refund')
-  ensure(msg.From == job.client, 'Only client can refund their job')
-
-  job.status = 'refunding'
-  -- Credit refund to client's pending balance
+  ensure(job.status == 'locked', 'Can only approve cancel when job is locked')
+  ensure(job.cancelRequest ~= nil, 'No cancel request present')
+  local other = (caller == job.client) and job.freelancer or ((caller == job.freelancer) and job.client or nil)
+  ensure(other ~= nil, 'Invalid approver')
+  ensure(caller ~= job.cancelRequest.requestedBy, 'Requester cannot approve own request')
+  -- Approve and refund to client
   credit(job.client, job.token, job.amount)
-  job.status = 'refunded'
-  job.refundedAt = now()
-  emit('Refunded', { 
-    jobId = jobId, 
-    status = 'refunded',
-    by = 'client',
-    client = job.client,
-    freelancer = job.freelancer,
-    amount = job.amount,
-    mode = 'pull'
-  })
+  job.cancelApprovedBy = caller
+  job.status = 'cancelled'
+  job.cancelledAt = now()
+  -- clear dispute/cancelRequest fields
+  job.dispute = nil
+  job.cancelRequest = nil
+  emit('JobCancelled', { jobId = jobId, by = caller, client = job.client, freelancer = job.freelancer, cancelledAt = job.cancelledAt })
 end)
 
--- OpenDispute: Allows client or freelancer to open a dispute on a locked job
--- Only works on jobs in 'locked' status (with assigned freelancer)
+-- =========================
+-- OpenDispute: either party can open dispute while locked
+-- =========================
 Handlers.add('OpenDispute', Handlers.utils.hasMatchingTag('Action', 'OpenDispute'), function(msg)
   ensure(not Paused, 'Paused')
   local jobId = tostring(msg.jobId)
@@ -441,161 +469,132 @@ Handlers.add('OpenDispute', Handlers.utils.hasMatchingTag('Action', 'OpenDispute
   local reason = msg.reason
   local job = jobs[jobId]
   ensure(job ~= nil, 'Job not found')
-  ensure(job.status == 'locked', 'Cannot dispute job that is not locked')
+  ensure(job.status == 'locked', 'Can only dispute when job is locked')
   ensure(caller == job.client or caller == job.freelancer, 'Only job parties can open dispute')
-  ensure(job.freelancer ~= nil, 'Cannot dispute job without assigned freelancer')
+  ensure(job.freelancer ~= nil, 'No freelancer assigned')
   if type(reason) == 'string' then ensure(#reason <= 1024, 'reason too long') end
+
   job.dispute = { openedBy = caller, reason = reason, openedAt = now() }
-  emit('DisputeOpened', { 
-    jobId = jobId, 
-    status = job.status, -- remains 'locked'
-    by = (caller == job.client) and 'client' or 'freelancer',
-    client = job.client,
-    freelancer = job.freelancer,
-    amount = job.amount,
-    reason = reason 
-  })
+  job.status = 'disputed'
+  emit('DisputeOpened', { jobId = jobId, openedBy = caller, reason = reason, openedAt = job.dispute.openedAt })
 end)
 
--- DecideDispute: Allows arbiter to resolve disputes by releasing or refunding
--- Can transition 'locked' → 'released' or 'locked' → 'refunded'
+-- =========================
+-- DecideDispute: arbiter resolves dispute; only arbiter can call
+-- outcome = 'release' or 'refund'
+-- =========================
 Handlers.add('DecideDispute', Handlers.utils.hasMatchingTag('Action', 'DecideDispute'), function(msg)
   ensure(not Paused, 'Paused')
   ensure(arbiter ~= nil, 'No arbiter configured')
   ensure(msg.From == arbiter, 'Only arbiter can decide disputes')
   local jobId = tostring(msg.jobId)
-  local outcome = msg.outcome -- 'release' or 'refund'
+  local outcome = msg.outcome
+  ensure(outcome == 'release' or outcome == 'refund', 'Invalid outcome')
   local job = jobs[jobId]
   ensure(job ~= nil, 'Job not found')
-  ensure(job.status == 'locked', 'Job must be locked to decide dispute')
-  ensure(job.dispute ~= nil, 'No dispute open for this job')
+  ensure(job.status == 'disputed', 'Job must be disputed to decide')
+  ensure(job.dispute ~= nil, 'No active dispute')
+
+  local amount = job.amount
+  local fee = '0'
+  if outcome == 'release' and platformFeeBps and platformFeeBps > 0 and platformTreasury and not isEmpty(platformTreasury) then
+    fee = bps(amount, platformFeeBps)
+  end
+  ensure(cmp(amount, fee) >= 0, 'Fee exceeds amount')
 
   if outcome == 'release' then
-    -- Reuse Release logic without client restriction
-    job.status = 'releasing'
-    local amount = job.amount
-    local fee = '0'
-    if platformFeeBps and platformFeeBps > 0 and platformTreasury then
-      fee = bps(amount, platformFeeBps)
-    end
-    ensure(cmp(amount, fee) >= 0, 'Fee exceeds amount')
     local payout = sub(amount, fee)
     if cmp(fee, '0') > 0 then credit(platformTreasury, job.token, fee) end
     if cmp(payout, '0') > 0 then credit(job.freelancer, job.token, payout) end
-
     job.status = 'released'
     job.releasedAt = now()
-    job.dispute = nil -- Clear dispute since job is finalized
-    emit('Released', { 
-      jobId = jobId, 
-      status = 'released',
-      by = 'arbiter',
-      client = job.client,
-      freelancer = job.freelancer,
-      amount = amount, 
-      fee = fee, 
-      payout = payout,
-      mode = 'pull'
-    })
-  elseif outcome == 'refund' then
-    job.status = 'refunding'
-    credit(job.client, job.token, job.amount)
+    job.dispute = nil
+    emit('Released', { jobId = jobId, by = 'arbiter', client = job.client, freelancer = job.freelancer, amount = amount, fee = fee, payout = payout, mode = 'pull' })
+  else
+    -- refund outcome
+    credit(job.client, job.token, amount)
     job.status = 'refunded'
     job.refundedAt = now()
-    job.dispute = nil -- Clear dispute since job is finalized
-    emit('Refunded', { 
-      jobId = jobId, 
-      status = 'refunded',
-      by = 'arbiter',
-      client = job.client,
-      freelancer = job.freelancer,
-      amount = job.amount,
-      mode = 'pull'
-    })
-  else
-    error('Invalid outcome: must be "release" or "refund"')
+    job.dispute = nil
+    emit('Refunded', { jobId = jobId, by = 'arbiter', client = job.client, amount = amount, mode = 'pull' })
   end
 end)
 
--- ClaimTimeout: Allows freelancer to claim payment after client inactivity timeout
--- Only works on jobs in 'locked' status after timeout period has passed
--- Timeout is calculated from when freelancer was assigned, not when job was created
-Handlers.add('ClaimTimeout', Handlers.utils.hasMatchingTag('Action', 'ClaimTimeout'), function(msg)
+-- =========================
+-- Release: client can release funds to freelancer only when locked
+-- This is the normal happy-path: client accepts work and releases funds
+-- =========================
+Handlers.add('Release', Handlers.utils.hasMatchingTag('Action', 'Release'), function(msg)
   ensure(not Paused, 'Paused')
-  ensure(timeoutSecs and timeoutSecs > 0, 'Timeouts disabled')
-  local jobId = tostring(msg.jobId)
+  local jobId = tostring(getTag(msg, 'jobId') or msg.jobId)
+  local caller = msg.From
   local job = jobs[jobId]
   ensure(job ~= nil, 'Job not found')
-  ensure(job.status == 'locked', 'Job must be locked to claim timeout')
-  ensure(job.freelancer ~= nil, 'Job must have assigned freelancer to claim timeout')
-  ensure(job.assignedAt ~= nil, 'Job missing assignment timestamp')
-  ensure((now() - job.assignedAt) >= timeoutSecs, 'Timeout period not yet reached since freelancer assignment')
+  ensure(job.status == 'locked', 'Job must be locked to release')
+  ensure(caller == job.client, 'Only client can release funds')
+  ensure(job.freelancer ~= nil and not isEmpty(job.freelancer), 'No freelancer assigned')
 
-  job.status = 'releasing'
   local amount = job.amount
   local fee = '0'
-  if platformFeeBps and platformFeeBps > 0 and platformTreasury then
+  if platformFeeBps and platformFeeBps > 0 and platformTreasury and not isEmpty(platformTreasury) then
     fee = bps(amount, platformFeeBps)
   end
   ensure(cmp(amount, fee) >= 0, 'Fee exceeds amount')
   local payout = sub(amount, fee)
+
   if cmp(fee, '0') > 0 then credit(platformTreasury, job.token, fee) end
   if cmp(payout, '0') > 0 then credit(job.freelancer, job.token, payout) end
 
   job.status = 'released'
   job.releasedAt = now()
-  emit('Released', { 
-    jobId = jobId, 
-    status = 'released',
-    by = 'timeout',
-    client = job.client,
-    freelancer = job.freelancer,
-    amount = amount, 
-    fee = fee, 
-    payout = payout,
-    mode = 'pull'
-  })
+  emit('Released', { jobId = jobId, by = 'client', client = job.client, freelancer = job.freelancer, amount = amount, fee = fee, payout = payout, mode = 'pull' })
 end)
 
--- AdminResetJob: Emergency function to reset jobs stuck in transition states
--- Resets 'releasing' or 'refunding' status back to 'locked' (no token transfers)
-Handlers.add('AdminResetJob', Handlers.utils.hasMatchingTag('Action', 'AdminResetJob'), function(msg)
-  ensure(Owner ~= nil and msg.From == Owner, 'Unauthorized: only owner can reset jobs')
+-- =========================
+-- Claim: withdraw pending balance for caller (pull)
+-- Reserve-first pattern, restore on failure
+-- =========================
+Handlers.add('Claim', Handlers.utils.hasMatchingTag('Action', 'Claim'), function(msg)
+  ensure(not Paused, 'Paused')
+  local claimant = msg.From
+  local token = getTag(msg, 'token') or msg.token or defaultToken
+  ensure(not isEmpty(token), 'Missing token')
+  local available = getPending(claimant, token)
+  ensure(cmp(available, '0') > 0, 'Nothing to claim')
+
+  local reqAmt = getTag(msg, 'amount') or msg.amount
+  if (not reqAmt) and type(msg.Data) == 'string' and #msg.Data > 0 then
+    local ok, parsed = pcall(json.decode, msg.Data)
+    if ok and type(parsed) == 'table' then reqAmt = parsed.amount or reqAmt end
+  end
+  local amount = tostring(reqAmt or available)
+  ensure(isDigits(amount) and cmp(amount,'0') > 0, 'Invalid amount')
+  ensure(cmp(available, amount) >= 0, 'Amount exceeds pending')
+
+  -- Reserve first
+  deduct(claimant, token, amount)
+
+  -- External transfer
+  local ok, reason = tokenTransfer(token, claimant, amount)
+  if not ok then
+    -- restore pending on failure
+    credit(claimant, token, amount)
+    emit('TransferFailed', { stage = 'Claim', address = claimant, token = token, amount = amount, reason = reason })
+    return
+  end
+
+  emit('Claimed', { address = claimant, token = token, amount = amount })
+end)
+
+-- =========================
+-- Views
+-- =========================
+Handlers.add('GetJob', Handlers.utils.hasMatchingTag('Action', 'GetJob'), function(msg)
   local jobId = tostring(msg.jobId)
   local job = jobs[jobId]
-  ensure(job ~= nil, 'Job not found')
-  ensure(job.status == 'releasing' or job.status == 'refunding', 'Job not in transition state')
-  job.status = 'locked'
-  emit('JobReset', { jobId = jobId })
+  ao.send({ Target = msg.From, Action = 'GetJobResult', JobId = jobId, Data = json.encode(job or {}) })
 end)
 
--- TransferOwnership: Allows current owner to transfer ownership to a new address
-Handlers.add('TransferOwnership', Handlers.utils.hasMatchingTag('Action', 'TransferOwnership'), function(msg)
-  ensure(Owner ~= nil and msg.From == Owner, 'Unauthorized: only current owner can transfer ownership')
-  ensure(not isEmpty(msg.newOwner), 'Missing newOwner address')
-  Owner = msg.newOwner
-  emit('OwnerSet', { owner = Owner })
-end)
-
--- View handlers: GetConfig, ListAllowedTokens, ListJobs
--- These provide read-only access to contract state
-
--- GetConfig: Returns current contract configuration
-Handlers.add('GetConfig', Handlers.utils.hasMatchingTag('Action', 'GetConfig'), function(msg)
-  local cfg = { Owner = Owner, Paused = Paused, platformFeeBps = platformFeeBps, platformTreasury = platformTreasury, arbiter = arbiter, timeoutSecs = timeoutSecs }
-  ao.send({ Target = msg.From, Action = 'GetConfigResult', Data = json.encode(cfg) })
-end)
-
--- ListAllowedTokens: Returns list of allowed token addresses
-Handlers.add('ListAllowedTokens', Handlers.utils.hasMatchingTag('Action', 'ListAllowedTokens'), function(msg)
-  local list = {}
-  for t, v in pairs(allowedTokens) do
-    if v then table.insert(list, t) end
-  end
-  ao.send({ Target = msg.From, Action = 'ListAllowedTokensResult', Data = json.encode(list) })
-end)
-
--- ListJobs: Returns paginated list of jobs with basic information
 Handlers.add('ListJobs', Handlers.utils.hasMatchingTag('Action', 'ListJobs'), function(msg)
   local res = {}
   local count = 0
@@ -608,7 +607,6 @@ Handlers.add('ListJobs', Handlers.utils.hasMatchingTag('Action', 'ListJobs'), fu
   ao.send({ Target = msg.From, Action = 'ListJobsResult', Data = json.encode(res) })
 end)
 
--- View: GetPending for an address (defaults to caller)
 Handlers.add('GetPending', Handlers.utils.hasMatchingTag('Action', 'GetPending'), function(msg)
   local addr = msg.addr or msg.From
   local res = {}
@@ -620,28 +618,45 @@ Handlers.add('GetPending', Handlers.utils.hasMatchingTag('Action', 'GetPending')
   ao.send({ Target = msg.From, Action = 'GetPendingResult', Address = addr, Data = json.encode(res) })
 end)
 
--- Claim: withdraw pending funds for caller (single token per call)
--- Params: token, amount (optional; defaults to full)
-Handlers.add('Claim', Handlers.utils.hasMatchingTag('Action', 'Claim'), function(msg)
-  ensure(not Paused, 'Paused')
-  local claimant = msg.From
+Handlers.add('GetConfig', Handlers.utils.hasMatchingTag('Action', 'GetConfig'), function(msg)
+  local cfg = {
+    Owner = Owner,
+    Paused = Paused,
+    arbiter = arbiter or '',
+    platformTreasury = platformTreasury or '',
+    platformFeeBps = platformFeeBps,
+    defaultToken = defaultToken,
+    transferMethod = 'direct-transfer', -- Indicate we use direct transfer now
+  }
+  ao.send({ Target = msg.From, Action = 'GetConfigResult', Data = json.encode(cfg) })
+end)
+
+-- Check received tokens for a user (for deposit preparation)
+Handlers.add('GetReceivedTokens', Handlers.utils.hasMatchingTag('Action', 'GetReceivedTokens'), function(msg)
+  local addr = msg.addr or msg.From
   local token = msg.token or defaultToken
-  ensure(not isEmpty(token), 'Missing token')
-  local available = getPending(claimant, token)
-  ensure(cmp(available, '0') > 0, 'Nothing to claim')
-  local amount = tostring(msg.amount or available)
-  ensure(isDigits(amount) and cmp(amount, '0') > 0, 'Invalid amount')
-  ensure(cmp(available, amount) >= 0, 'Amount exceeds pending')
-
-  -- Attempt transfer; only deduct on success
-  local ok, err = pcall(function()
-    transfer(token, claimant, amount)
-  end)
-  if not ok then
-    emit('TransferFailed', { stage = 'Claim', address = claimant, token = token, amount = amount, reason = tostring(err) })
-    return
+  local res = {}
+  
+  if receivedTokens[token] and receivedTokens[token][addr] then
+    res.available = receivedTokens[token][addr]
+  else
+    res.available = '0'
   end
+  
+  res.token = token
+  res.address = addr
+  
+  ao.send({ Target = msg.From, Action = 'GetReceivedTokensResult', Data = json.encode(res) })
+end)
 
-  deduct(claimant, token, amount)
-  emit('Claimed', { address = claimant, token = token, amount = amount })
+-- =========================
+-- Updated Receive handler for direct transfer compatibility
+-- =========================
+Handlers.add('Receive', Handlers.utils.hasMatchingTag('Action', 'Receive'), function(msg)
+  -- This contract now supports direct token transfers via Credit-Notice
+  -- Clients should: 1) Transfer tokens to escrow, 2) Call Deposit action
+  emit('DirectReceiveAttempt', { 
+    from = msg.From, 
+    instruction = 'Use two-step process: Transfer tokens first, then call Deposit action' 
+  })
 end)

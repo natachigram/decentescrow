@@ -1,4 +1,4 @@
--- Minimal AO runtime mocks for unit testing
+-- Minimal AO runtime mocks for unit testing (fresh, deduped)
 Handlers = {
   _handlers = {},
   add = function(name, predicate, fn)
@@ -22,16 +22,14 @@ ao = {
     table.insert(ao.emitted, { event = event, payload = payload })
   end,
   send = function(msg)
-    -- allow tests to simulate failures
     if ao._failRules and #ao._failRules > 0 then
-      for _,rule in ipairs(ao._failRules) do
-        local shouldFail = false
-        local ok, res = pcall(rule, msg)
-        if ok then shouldFail = res else shouldFail = false end
-        if shouldFail then error('Simulated send failure') end
+      for _, rule in ipairs(ao._failRules) do
+        local ok, shouldFail = pcall(rule, msg)
+        if ok and shouldFail then error('Simulated send failure') end
       end
     end
     table.insert(ao.sent, msg)
+    return true
   end,
   addFailRule = function(rule)
     table.insert(ao._failRules, rule)
@@ -44,14 +42,12 @@ ao = {
 -- Simple JSON shim for tests
 local jsonMock = {
   encode = function(tbl)
-    -- naive encoder for tests; not full JSON
     local ok, cjson = pcall(require, 'cjson')
     if ok and cjson then return cjson.encode(tbl) end
-    -- fallback: very limited
     if type(tbl) == 'table' then
-      local parts = {'{'}
       local first = true
-      for k,v in pairs(tbl) do
+      local parts = { '{' }
+      for k, v in pairs(tbl) do
         if not first then table.insert(parts, ',') end
         first = false
         table.insert(parts, string.format('\"%s\":\"%s\"', tostring(k), tostring(v)))
@@ -64,7 +60,7 @@ local jsonMock = {
   decode = function(str)
     local ok, cjson = pcall(require, 'cjson')
     if ok and cjson then return cjson.decode(str) end
-    error('json.decode not available in mock without cjson')
+    error('json.decode not available without cjson in mock')
   end
 }
 

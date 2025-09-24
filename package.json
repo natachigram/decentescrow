@@ -1,5 +1,33 @@
 {
+  "name": "decentescrow-comprehensive-tests",
+  "version": "2.0.0",
+  "description": "Comprehensive test suite for DecentEscrow AO contract with full verification",
+  "type": "module",
+  "main": "escrow-test.js",
+  "scripts": {
+    "test": "node escrow-test.js",
+    "test:quick": "node quick-test.js",
+    "test:watch": "nodemon escrow-test.js",
+    "test:verbose": "DEBUG=* node escrow-test.js"
+  },
+  "dependencies": {
+    "@permaweb/aoconnect": "^0.0.90",
+    "dotenv": "^16.4.5"
+  },
   "devDependencies": {
-    "ao-deploy": "^0.9.1"
+    "nodemon": "^3.0.2"
+  },
+  "keywords": [
+    "arweave",
+    "ao",
+    "escrow",
+    "testing",
+    "blockchain",
+    "smart-contract"
+  ],
+  "author": "DecentEscrow Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

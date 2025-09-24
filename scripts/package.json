@@ -16,6 +16,7 @@
         "admin": "node admin.js",
         "bootstrap": "node bootstrap.js",
         "claim": "node claim.js",
-        "cancel": "node cancel.js"
+        "cancel": "node cancel.js",
+        "init": "node init.js"
     }
 }

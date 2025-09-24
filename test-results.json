@@ -1,0 +1,114 @@
+{
+  "summary": {
+    "totalTests": 14,
+    "passed": 4,
+    "failed": 10,
+    "duration": 210824,
+    "successRate": 28.57142857142857
+  },
+  "results": [
+    {
+      "suite": "Admin and Configuration",
+      "test": "Initialize Owner",
+      "status": "PASS",
+      "duration": 2800,
+      "error": null
+    },
+    {
+      "suite": "Admin and Configuration",
+      "test": "Set Configuration",
+      "status": "FAIL",
+      "duration": 515,
+      "error": "500: {\"error\":\"Error: Rate limit exceeded\"}"
+    },
+    {
+      "suite": "Admin and Configuration",
+      "test": "Get Configuration",
+      "status": "FAIL",
+      "duration": 728,
+      "error": "500: {\"error\":\"Error: Rate limit exceeded\"}"
+    },
+    {
+      "suite": "Admin and Configuration",
+      "test": "Pause and Unpause",
+      "status": "FAIL",
+      "duration": 568,
+      "error": "500: {\"error\":\"Error: Rate limit exceeded\"}"
+    },
+    {
+      "suite": "Job Lifecycle",
+      "test": "Happy Path: Deposit → Assign → Release → Claim",
+      "status": "FAIL",
+      "duration": 15312,
+      "error": "500: {\"error\":\"Error: Rate limit exceeded\"}"
+    },
+    {
+      "suite": "Job Lifecycle",
+      "test": "Deposit with Metadata",
+      "status": "FAIL",
+      "duration": 11750,
+      "error": "500: {\"error\":\"Error: Rate limit exceeded\"}"
+    },
+    {
+      "suite": "Job Lifecycle",
+      "test": "List Jobs",
+      "status": "FAIL",
+      "duration": 610,
+      "error": "500: {\"error\":\"Error: Rate limit exceeded\"}"
+    },
+    {
+      "suite": "Cancellation Flows",
+      "test": "Cancel Unassigned Job",
+      "status": "FAIL",
+      "duration": 11453,
+      "error": "500: {\"error\":\"Error: Rate limit exceeded\"}"
+    },
+    {
+      "suite": "Cancellation Flows",
+      "test": "Mutual Cancel Flow",
+      "status": "FAIL",
+      "duration": 10839,
+      "error": "500: {\"error\":\"Error: Rate limit exceeded\"}"
+    },
+    {
+      "suite": "Dispute System",
+      "test": "Open Dispute",
+      "status": "FAIL",
+      "duration": 56936,
+      "error": "500: {\"error\":\"Error: Rate limit exceeded\"}"
+    },
+    {
+      "suite": "Error Handling",
+      "test": "Invalid Job ID",
+      "status": "FAIL",
+      "duration": 440,
+      "error": "500: {\"error\":\"Error: Rate limit exceeded\"}"
+    },
+    {
+      "suite": "Error Handling",
+      "test": "Duplicate Job ID",
+      "status": "PASS",
+      "duration": 11306,
+      "error": null
+    },
+    {
+      "suite": "Error Handling",
+      "test": "Invalid Amount",
+      "status": "PASS",
+      "duration": 8315,
+      "error": null
+    },
+    {
+      "suite": "Performance Tests",
+      "test": "Multiple Jobs Creation",
+      "status": "PASS",
+      "duration": 51219,
+      "error": null
+    }
+  ],
+  "timestamp": "2025-09-23T15:30:48.768Z",
+  "config": {
+    "escrowProcess": "ktl0iPdM44_VfTAVF557vSqaF9AfUAFUKDDaQRWyjf0",
+    "tokenProcess": "agYcCFJtrMG6cqMuZfskIkFTGvUPddICmtQSBIoPdiA"
+  }
+}
