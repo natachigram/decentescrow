@@ -339,14 +339,21 @@ Handlers.add('Deposit', Handlers.utils.hasMatchingTag('Action', 'Deposit'), func
   -- Check if client has transferred sufficient tokens to escrow
   local ok, reason = consumeReceivedTokens(token, client, amount)
   if not ok then
-    emit('DepositFailed', { 
-      stage = 'TokenVerification', 
-      jobId = jobId, 
-      by = client, 
+    local available = '0'
+    if receivedTokens[token] and receivedTokens[token][client] then
+      available = receivedTokens[token][client]
+    end
+    emit('DepositFailed', {
+      stage = 'TokenVerification',
+      jobId = jobId,
+      by = client,
       reason = reason,
-      instruction = 'Transfer tokens to escrow first, then call Deposit'
+      required = amount,
+      available = available,
+      token = token,
+      instruction = 'Perform Transfer -> wait for Credit-Notice (poll GetReceivedTokens) -> Deposit'
     })
-    error('Insufficient tokens transferred: ' .. tostring(reason))
+    error('Deposit failed: need '..amount..' got '..available..' ('..tostring(reason)..')')
   end
 
   local nowTs = now()
@@ -659,4 +666,44 @@ Handlers.add('Receive', Handlers.utils.hasMatchingTag('Action', 'Receive'), func
     from = msg.From, 
     instruction = 'Use two-step process: Transfer tokens first, then call Deposit action' 
   })
+end)
+
+-- =========================
+-- Debug: enumerate received token buckets for an address (or all, owner only)
+-- Action=GetReceivedDetail, optional tag 'addr'
+-- WARNING: Iterating all senders can be large; restrict when possible.
+-- =========================
+Handlers.add('GetReceivedDetail', Handlers.utils.hasMatchingTag('Action', 'GetReceivedDetail'), function(msg)
+  local caller = msg.From
+  local addrFilter = getTag(msg, 'addr') or msg.addr
+  local tokenFilter = getTag(msg, 'token') or msg.token
+  local result = { entries = {}, filtered = false }
+
+  if addrFilter and addrFilter ~= '' then
+    result.filtered = true
+    if tokenFilter and tokenFilter ~= '' then
+      local amt = '0'
+      if receivedTokens[tokenFilter] and receivedTokens[tokenFilter][addrFilter] then
+        amt = receivedTokens[tokenFilter][addrFilter]
+      end
+      table.insert(result.entries, { token = tokenFilter, address = addrFilter, amount = amt })
+    else
+      for t, senders in pairs(receivedTokens) do
+        local amt = senders[addrFilter]
+        if amt then table.insert(result.entries, { token = t, address = addrFilter, amount = amt }) end
+      end
+    end
+  else
+    -- Only owner can enumerate all to avoid info leakage
+    if Owner == nil or caller ~= Owner then
+      ao.send({ Target = caller, Action = 'GetReceivedDetailResult', Data = json.encode({ error = 'Owner only or provide addr filter' }) })
+      return
+    end
+    for t, senders in pairs(receivedTokens) do
+      for addr, amt in pairs(senders) do
+        table.insert(result.entries, { token = t, address = addr, amount = amt })
+      end
+    end
+  end
+  ao.send({ Target = caller, Action = 'GetReceivedDetailResult', Data = json.encode(result) })
 end)

@@ -203,3 +203,50 @@ Backend must handle:
 
 ---
 
+## 🔄 Robust Deposit Flow (Direct-Transfer Model)
+
+The escrow now uses a two-step deposit: **Token Transfer -> Credit-Notice -> Deposit**. A direct `Deposit` without prior credited tokens will fail with a `DepositFailed` event.
+
+Use the helper script:
+
+```bash
+node scripts/depositWithPolling.js 10000   # amount; jobId auto-generated
+```
+
+Or specify a job id:
+
+```bash
+node scripts/depositWithPolling.js 25000 my-custom-job-123
+```
+
+Script steps:
+1. Transfer tokens to escrow process (using `TOKEN_PROCESS_ID` in config).
+2. Poll `GetReceivedTokens` until `available >= amount` (Credit-Notice processed).
+3. Invoke `Deposit` with stable lowercase tags (`jobId`, `amount`, `meta`).
+4. Fetch and display job record.
+
+### Debugging Token Credits
+New view handler: `GetReceivedDetail`.
+
+Examples:
+```bash
+# Filtered (any caller):
+node some-script.js Action=GetReceivedDetail addr=<ADDRESS>
+
+# Owner-only full dump (omit addr) - avoid in production due to size.
+```
+
+If deposits fail, compare `required` vs `available` fields in emitted `DepositFailed` event to see if Credit-Notice lag or token process mismatch.
+
+### Common Failure Causes
+- Token transfer not yet processed (insufficient wait/poll).
+- Wrong sender (transfer done by wallet A, deposit attempted by wallet B).
+- Reused `jobId`.
+- Token process not emitting `Action=Credit-Notice` with `Sender` & `Quantity` tags.
+
+### Recommended Mitigation
+- Always poll or subscribe to credits before depositing.
+- Use unique monotonic job IDs (`job-<timestamp>-<rand>`).
+- Validate `GetReceivedTokens` just prior to `Deposit`.
+
+
